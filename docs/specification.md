@@ -27,6 +27,14 @@ CORK（COncurrency + ORder Kernel）は、LLM/Tool実行を「実行OS（Kernel�
 
 ---
 
+## 1.3 参照ドキュメント
+- 共通 Definition of Done: [`docs/dod.md`](dod.md)
+- MVPスコープ: [`docs/mvp.md`](mvp.md)
+- 正規化仕様: [`docs/canonicalization.md`](canonicalization.md)
+- ハッシュ仕様: [`docs/hashing.md`](hashing.md)
+
+---
+
 ## 2. 参照規格・外部前提
 CORKは相互運用性を確保するため、以下の規格・概念を採用する。
 

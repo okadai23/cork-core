@@ -13,6 +13,15 @@
 - Test: `make test`
 - Build: `make build`
 
+## Documentation index
+- README: [`README.md`](README.md)
+- 共通 Definition of Done: [`docs/dod.md`](docs/dod.md)
+- MVPスコープ: [`docs/mvp.md`](docs/mvp.md)
+- 仕様書（Core）: [`docs/specification.md`](docs/specification.md)
+- 正規化仕様: [`docs/canonicalization.md`](docs/canonicalization.md)
+- ハッシュ仕様: [`docs/hashing.md`](docs/hashing.md)
+- ADR一覧: [`docs/adr/`](docs/adr/)
+
 ## Documentation & schemas
 - Core仕様は `docs/specification.md` を参照。
 - 正規化/ハッシュ仕様は `docs/canonicalization.md` と `docs/hashing.md` に集約。
