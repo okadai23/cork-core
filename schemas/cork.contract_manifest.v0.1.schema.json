@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cork.contract_manifest.v0.1",
+  "title": "CORK Contract Graph Manifest v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "manifest_id", "contract_graph", "defaults"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "cork.contract_manifest.v0.1" },
+    "manifest_id": { "type": "string", "minLength": 8, "maxLength": 128 },
+    "name": { "type": "string", "maxLength": 256 },
+    "description": { "type": "string", "maxLength": 4096 },
+    "labels": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "maxLength": 256 }
+    },
+    "contract_graph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stages"],
+      "properties": {
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Stage" }
+        }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expansion_policy", "stage_budget", "stage_ttl", "completion_policy"],
+      "properties": {
+        "expansion_policy": { "$ref": "#/$defs/ExpansionPolicy" },
+        "stage_budget": { "$ref": "#/$defs/Budget" },
+        "stage_ttl": { "$ref": "#/$defs/StageTTL" },
+        "completion_policy": { "$ref": "#/$defs/StageCompletionPolicy" }
+      }
+    }
+  },
+  "$defs": {
+    "StageId": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_\\-]{0,63}$" },
+    "NodeKind": { "type": "string", "enum": ["LLM", "TOOL", "MERGE", "SWITCH", "LOOP", "BARRIER"] },
+    "DependencyConstraint": { "type": "string", "enum": ["HARD", "SOFT"] },
+    "Dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage_id", "constraint"],
+      "properties": {
+        "stage_id": { "$ref": "#/$defs/StageId" },
+        "constraint": { "$ref": "#/$defs/DependencyConstraint" }
+      }
+    },
+    "AllowCrossStageDeps": { "type": "string", "enum": ["NONE", "ONLY_PAST", "ANY"] },
+    "ExpansionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow_dynamic", "allow_kinds", "max_dynamic_nodes", "max_steps_in_stage", "allow_cross_stage_deps"],
+      "properties": {
+        "allow_dynamic": { "type": "boolean" },
+        "allow_kinds": {
+          "type": "array",
+          "minItems": 0,
+          "items": { "$ref": "#/$defs/NodeKind" }
+        },
+        "max_dynamic_nodes": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "max_steps_in_stage": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "allow_cross_stage_deps": { "$ref": "#/$defs/AllowCrossStageDeps" }
+      }
+    },
+    "Budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wall_ms": { "type": "integer", "minimum": 1, "maximum": 604800000 },
+        "tokens_in_max": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "tokens_out_max": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+        "cost_usd_max": { "type": "number", "minimum": 0, "maximum": 1000000 },
+        "max_steps": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "max_dynamic_nodes": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "history_max_events": { "type": "integer", "minimum": 100, "maximum": 100000000 },
+        "history_max_bytes": { "type": "integer", "minimum": 1024, "maximum": 10737418240 }
+      }
+    },
+    "StageTTL": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "result_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 31536000000 },
+        "wait_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 31536000000 }
+      }
+    },
+    "StageCompletionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fail_on_any_failure", "require_commit"],
+      "properties": {
+        "fail_on_any_failure": { "type": "boolean" },
+        "require_commit": {
+          "type": "boolean",
+          "description": "Commit is emitted by Core auto-commit; planner does not need to send it."
+        },
+        "post_is_blocking": { "type": "boolean", "default": false }
+      }
+    },
+    "Stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage_id"],
+      "properties": {
+        "stage_id": { "$ref": "#/$defs/StageId" },
+        "title": { "type": "string", "maxLength": 256 },
+        "dependencies": { "type": "array", "items": { "$ref": "#/$defs/Dependency" } },
+        "expansion_policy": { "$ref": "#/$defs/ExpansionPolicy" },
+        "stage_budget": { "$ref": "#/$defs/Budget" },
+        "stage_ttl": { "$ref": "#/$defs/StageTTL" },
+        "completion_policy": { "$ref": "#/$defs/StageCompletionPolicy" },
+        "tags": { "type": "array", "items": { "type": "string", "maxLength": 64 } },
+        "metadata": { "type": "object", "additionalProperties": true }
+      }
+    }
+  }
+}

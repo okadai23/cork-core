@@ -1,0 +1,382 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cork.policy.v0.1",
+  "title": "CORK Policy DSL v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "policy_id",
+    "run_budget",
+    "concurrency",
+    "retry",
+    "rate_limit",
+    "idle",
+    "guardrails",
+    "context",
+    "cache",
+    "loop_detection",
+    "retention",
+    "scheduler",
+    "stage_auto_commit"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "cork.policy.v0.1" },
+    "policy_id": { "type": "string", "minLength": 8, "maxLength": 128 },
+    "name": { "type": "string", "maxLength": 256 },
+    "description": { "type": "string", "maxLength": 4096 },
+
+    "run_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_ms",
+        "deadline_mode",
+        "tokens_in_max",
+        "tokens_out_max",
+        "cost_usd_max",
+        "max_steps",
+        "max_dynamic_nodes",
+        "history_max_events",
+        "history_max_bytes"
+      ],
+      "properties": {
+        "wall_ms": { "type": "integer", "minimum": 1, "maximum": 604800000 },
+        "deadline_mode": { "type": "string", "enum": ["RELATIVE", "ABSOLUTE"] },
+        "deadline_ms": { "type": "integer", "minimum": 1, "maximum": 604800000 },
+        "deadline_unix_ms": { "type": "integer", "minimum": 0, "maximum": 32503680000000 },
+
+        "tokens_in_max": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "tokens_out_max": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+        "cost_usd_max": { "type": "number", "minimum": 0, "maximum": 1000000 },
+
+        "max_steps": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "max_dynamic_nodes": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+
+        "history_max_events": { "type": "integer", "minimum": 100, "maximum": 100000000 },
+        "history_max_bytes": { "type": "integer", "minimum": 1024, "maximum": 10737418240 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "deadline_mode": { "const": "RELATIVE" } } },
+          "then": { "required": ["deadline_ms"] }
+        },
+        {
+          "if": { "properties": { "deadline_mode": { "const": "ABSOLUTE" } } },
+          "then": { "required": ["deadline_unix_ms"] }
+        }
+      ]
+    },
+
+    "concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["io_max", "cpu_max", "per_stage_max", "per_provider_max"],
+      "properties": {
+        "io_max": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "cpu_max": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "per_stage_max": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "per_provider_max": { "type": "integer", "minimum": 1, "maximum": 100000 }
+      }
+    },
+
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts", "backoff", "retry_on", "respect_retry_after", "circuit_breaker"],
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "backoff": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "base_delay_ms", "max_delay_ms", "jitter"],
+          "properties": {
+            "policy": { "type": "string", "enum": ["EXPONENTIAL", "LINEAR", "CONSTANT"] },
+            "base_delay_ms": { "type": "integer", "minimum": 0, "maximum": 600000 },
+            "max_delay_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
+            "jitter": { "type": "string", "enum": ["NONE", "FULL", "EQUAL"] }
+          }
+        },
+        "retry_on": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "HTTP_408",
+              "HTTP_409",
+              "HTTP_425",
+              "HTTP_429",
+              "HTTP_500",
+              "HTTP_502",
+              "HTTP_503",
+              "HTTP_504",
+              "TIMEOUT",
+              "TRANSIENT_NETWORK"
+            ]
+          }
+        },
+        "respect_retry_after": { "type": "boolean" },
+        "circuit_breaker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "open_after_failures", "half_open_after_ms"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "open_after_failures": { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "half_open_after_ms": { "type": "integer", "minimum": 100, "maximum": 3600000 }
+          }
+        }
+      }
+    },
+
+    "rate_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providers"],
+      "properties": {
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_id", "rpm", "tpm", "max_concurrency"],
+            "properties": {
+              "provider_id": { "type": "string", "maxLength": 64 },
+              "rpm": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+              "tpm": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+              "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 100000 }
+            }
+          }
+        }
+      }
+    },
+
+    "idle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["heartbeat_interval_ms", "idle_timeout_ms"],
+      "properties": {
+        "heartbeat_interval_ms": { "type": "integer", "minimum": 100, "maximum": 600000 },
+        "idle_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000 }
+      }
+    },
+
+    "guardrails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store_prompts",
+        "store_completions",
+        "store_tool_io",
+        "pre_call",
+        "during_call",
+        "post_call",
+        "on_violation"
+      ],
+      "properties": {
+        "store_prompts": { "type": "string", "enum": ["none", "redacted", "full"] },
+        "store_completions": { "type": "string", "enum": ["none", "redacted", "full"] },
+        "store_tool_io": { "type": "string", "enum": ["none", "redacted", "full"] },
+        "pre_call": { "$ref": "#/$defs/GuardList" },
+        "during_call": { "$ref": "#/$defs/GuardList" },
+        "post_call": { "$ref": "#/$defs/GuardList" },
+        "on_violation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "max_retries"],
+          "properties": {
+            "action": { "type": "string", "enum": ["BLOCK", "MASK", "RETRY", "FALLBACK"] },
+            "max_retries": { "type": "integer", "minimum": 0, "maximum": 10 }
+          }
+        }
+      }
+    },
+
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token_counter", "compression"],
+      "properties": {
+        "token_counter": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["impl", "strict_mode"],
+          "properties": {
+            "impl": { "type": "string", "maxLength": 64 },
+            "strict_mode": { "type": "boolean" }
+          }
+        },
+        "compression": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "steps"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "type"],
+                "properties": {
+                  "name": { "type": "string", "maxLength": 64 },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "DROP_OLDEST",
+                      "SUMMARIZE_HISTORY",
+                      "SUMMARIZE_TOOL_RESULTS",
+                      "RAG_REHYDRATE",
+                      "FAIL_IF_EXCEED"
+                    ]
+                  },
+                  "target_tokens": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+                  "summarizer_llm": { "type": "object", "additionalProperties": true }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "default_ttl_ms", "rules"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "default_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 31536000000 },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "priority", "match", "action"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 64 },
+              "priority": { "type": "integer", "minimum": 0, "maximum": 100000 },
+              "match": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "node_kind": {
+                    "type": "string",
+                    "enum": ["LLM", "TOOL", "MERGE", "SWITCH", "LOOP", "BARRIER"]
+                  },
+                  "tool_name": { "type": "string", "maxLength": 128 },
+                  "llm_model": { "type": "string", "maxLength": 128 }
+                }
+              },
+              "action": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["cacheable", "ttl_ms"],
+                "properties": {
+                  "cacheable": { "type": "boolean" },
+                  "ttl_ms": { "type": "integer", "minimum": 0, "maximum": 31536000000 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "loop_detection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_steps", "max_dynamic_nodes", "no_progress"],
+      "properties": {
+        "max_steps": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "max_dynamic_nodes": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "no_progress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "repeat_threshold", "fingerprint_keys"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "repeat_threshold": { "type": "integer", "minimum": 2, "maximum": 10000 },
+            "fingerprint_keys": {
+              "type": "array",
+              "items": { "type": "string", "maxLength": 256 }
+            }
+          }
+        }
+      }
+    },
+
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_log_ttl_ms", "artifact_ttl_ms", "trace_ttl_ms"],
+      "properties": {
+        "event_log_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 31536000000 },
+        "artifact_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 31536000000 },
+        "trace_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 31536000000 }
+      }
+    },
+
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "tie_break"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["LIST_HEURISTIC", "OPTIMIZE_CP_SAT", "HTN_ORDERED"]
+        },
+        "tie_break": {
+          "type": "string",
+          "enum": [
+            "FIFO",
+            "PRIORITY",
+            "SHORTEST_ESTIMATED_FIRST",
+            "LONGEST_ESTIMATED_FIRST"
+          ]
+        }
+      }
+    },
+
+    "stage_auto_commit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "quiescence_ms", "max_open_ms", "exclude_when_waiting"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "quiescence_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
+        "max_open_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 },
+        "exclude_when_waiting": { "type": "boolean" }
+      }
+    },
+
+    "resource_pools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["resource_id", "capacity", "kind"],
+        "properties": {
+          "resource_id": { "type": "string", "maxLength": 128 },
+          "capacity": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+          "kind": { "type": "string", "enum": ["CUMULATIVE", "EXCLUSIVE"] },
+          "tags": { "type": "array", "items": { "type": "string", "maxLength": 64 } }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "GuardList": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 128 },
+          "config": { "type": "object", "additionalProperties": true }
+        }
+      }
+    }
+  }
+}

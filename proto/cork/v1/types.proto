@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package cork.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message RunHandle {
+  string run_id = 1;
+}
+
+message Sha256 {
+  bytes bytes32 = 1; // must be 32 bytes
+}
+
+message CanonicalJsonDocument {
+  bytes canonical_json_utf8 = 1;
+  Sha256 sha256 = 2;
+  string schema_id = 3; // e.g. cork.contract_manifest.v0.1
+}
+
+message Payload {
+  string content_type = 1;  // e.g. application/json, text/plain
+  bytes data = 2;
+  string encoding = 3;      // e.g. utf-8, base64
+  Sha256 sha256 = 4;
+}
+
+message ArtifactRef {
+  string uri = 1;
+  Sha256 sha256 = 2;
+  string content_type = 3;
+  int64 size_bytes = 4;
+}
+
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  RUN_PENDING = 1;
+  RUN_RUNNING = 2;
+  RUN_SUCCEEDED = 3;
+  RUN_FAILED = 4;
+  RUN_CANCELLED = 5;
+  RUN_TIMED_OUT = 6;
+}
+
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_PENDING = 1;
+  NODE_READY = 2;
+  NODE_RUNNING = 3;
+  NODE_SUCCEEDED = 4;
+  NODE_FAILED = 5;
+  NODE_SKIPPED = 6;
+  NODE_CANCELLED = 7;
+  NODE_TIMED_OUT = 8;
+  NODE_EXPIRED = 9;
+  NODE_STALE = 10;
+}
+
+message TraceContext {
+  string traceparent = 1;
+  string tracestate = 2;
+}
+
+message LogRecord {
+  google.protobuf.Timestamp ts = 1;
+  string level = 2;
+  string message = 3;
+
+  string trace_id_hex = 10;
+  string span_id_hex = 11;
+
+  string scope_id = 12;
+  int64 scope_seq = 13;
+
+  map<string, string> attrs = 20;
+}
+
+message NodeStateChanged {
+  string stage_id = 1;
+  string node_id = 2;
+  NodeStatus old_status = 3;
+  NodeStatus new_status = 4;
+  string reason = 5;
+}
+
+message StageLifecycleEvent {
+  string stage_id = 1;
+  string from_state = 2; // e.g. ACTIVE
+  string to_state = 3;   // e.g. COMMITTED
+  string reason = 4;     // e.g. auto_commit_quiescence
+}
+
+message BudgetEvent {
+  string kind = 1;
+  map<string, string> attrs = 2;
+}
+
+message PolicyEvent {
+  string kind = 1;
+  map<string, string> attrs = 2;
+}
+
+message RunEvent {
+  int64 event_seq = 1; // total order for replay
+  google.protobuf.Timestamp ts = 2;
+
+  oneof event {
+    NodeStateChanged node_state = 10;
+    CanonicalJsonDocument graph_patch = 11;
+    LogRecord log = 12;
+    BudgetEvent budget = 13;
+    PolicyEvent policy = 14;
+    StageLifecycleEvent stage = 15;
+  }
+}
+
+message HashBundle {
+  Sha256 contract_manifest_hash = 1;
+  Sha256 policy_hash = 2;
+  Sha256 run_config_hash = 3;
+  Sha256 composite_graph_hash = 4;
+}

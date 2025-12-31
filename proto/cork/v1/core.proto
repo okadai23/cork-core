@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package cork.v1;
+
+import "google/protobuf/timestamp.proto";
+import "cork/v1/types.proto";
+
+service CorkCore {
+  rpc SubmitRun(SubmitRunRequest) returns (SubmitRunResponse);
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc StreamRunEvents(StreamRunEventsRequest) returns (stream RunEvent);
+
+  rpc ApplyGraphPatch(ApplyGraphPatchRequest) returns (ApplyGraphPatchResponse);
+
+  rpc GetCompositeGraph(GetCompositeGraphRequest) returns (GetCompositeGraphResponse);
+  rpc GetLogs(GetLogsRequest) returns (GetLogsResponse);
+}
+
+message SubmitRunRequest {
+  CanonicalJsonDocument contract_manifest = 1;
+  CanonicalJsonDocument policy = 2;
+  Payload initial_input = 3;
+
+  string experiment_id = 10;
+  string variant_id = 11;
+
+  TraceContext trace_context = 20;
+}
+
+message SubmitRunResponse {
+  RunHandle handle = 1;
+  HashBundle hashes = 2;
+  google.protobuf.Timestamp created_at = 3;
+}
+
+message CancelRunRequest {
+  RunHandle handle = 1;
+  string reason = 2;
+}
+message CancelRunResponse { bool accepted = 1; }
+
+message GetRunRequest { RunHandle handle = 1; }
+message GetRunResponse {
+  RunHandle handle = 1;
+  RunStatus status = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  HashBundle hashes = 5;
+  string active_stage_id = 10;
+}
+
+message ListRunsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  string experiment_id = 10;
+  string variant_id = 11;
+  RunStatus status = 12;
+}
+message ListRunsResponse {
+  repeated GetRunResponse runs = 1;
+  string next_page_token = 2;
+}
+
+message StreamRunEventsRequest {
+  RunHandle handle = 1;
+  int64 since_event_seq = 2;
+}
+
+message ApplyGraphPatchRequest {
+  RunHandle handle = 1;
+  CanonicalJsonDocument patch = 2; // schema: cork.graph_patch.v0.1
+  string actor_id = 10;
+}
+
+message ApplyGraphPatchResponse {
+  bool accepted = 1;
+  string rejection_reason = 2;
+}
+
+message GetCompositeGraphRequest { RunHandle handle = 1; }
+message GetCompositeGraphResponse {
+  CanonicalJsonDocument contract_manifest = 1;
+  repeated CanonicalJsonDocument patches_in_order = 2;
+  HashBundle hashes = 3;
+}
+
+message GetLogsRequest {
+  RunHandle handle = 1;
+  string scope_id = 2;
+  string span_id_hex = 3;
+  string stage_id = 4;
+  string node_id = 5;
+  int32 page_size = 10;
+  string page_token = 11;
+}
+message GetLogsResponse {
+  repeated LogRecord logs = 1;
+  string next_page_token = 2;
+}

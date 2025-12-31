@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package cork.v1;
+
+import "google/protobuf/timestamp.proto";
+import "cork/v1/types.proto";
+
+service CorkWorker {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc InvokeTool(InvokeToolRequest) returns (InvokeToolResponse);
+  rpc InvokeToolStream(InvokeToolRequest) returns (stream InvokeToolStreamChunk);
+}
+
+message HealthRequest {}
+message HealthResponse {
+  string status = 1;
+  string worker_id = 2;
+}
+
+message InvokeToolRequest {
+  string invocation_id = 1;
+  string tool_name = 2;
+  string tool_version = 3;
+  Payload input = 4;
+
+  google.protobuf.Timestamp deadline = 10;
+  string idempotency_key = 11;
+
+  TraceContext trace_context = 20;
+}
+
+message InvokeToolResponse {
+  Payload output = 1;
+  repeated ArtifactRef artifacts = 2;
+  string error_code = 10;
+  string error_message = 11;
+}
+
+message InvokeToolStreamChunk {
+  google.protobuf.Timestamp ts = 1;
+  oneof chunk {
+    string heartbeat = 10;
+    Payload partial_output = 11;
+    InvokeToolResponse final = 12;
+    LogRecord log = 13;
+  }
+}
