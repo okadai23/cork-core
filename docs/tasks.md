@@ -186,17 +186,23 @@ CORE-010
 
 ### サブタスク
 
-- [ ] `EventLog`（Run単位）:
+- [x] `EventLog`（Run単位）:
   - `next_seq: u64`
   - `events: Vec<RunEvent>`（MVPは全保持、retentionは後）
   - `broadcast::Sender<RunEvent>`（push通知）
-- [ ] `append(event)`:
+- [x] `append(event)`:
   - `event_seq` を採番し、Vecにpushし、broadcast送信
-- [ ] `subscribe(since_seq)`:
+- [x] `subscribe(since_seq)`:
   - backlog（events[since..]）→その後 broadcast stream
-- [ ] gRPC `StreamRunEvents` 実装:
+- [x] gRPC `StreamRunEvents` 実装:
   - `since_event_seq` から開始
   - クライアント切断時の扱い（dropでOK）
+
+### 進捗
+
+- [DONE] EventLog と gRPC StreamRunEvents を実装。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-proto/build.rs`, `crates/cork-proto/Cargo.toml`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 ### DoD
 
