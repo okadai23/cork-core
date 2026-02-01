@@ -138,16 +138,16 @@ CORE-002
 
 ### サブタスク
 
-- [ ] `RunId`（String）生成：uuid/ulidのどちらかに固定
-- [ ] `RunRegistry` 実装:
+- [x] `RunId`（String）生成：uuid/ulidのどちらかに固定
+- [x] `RunRegistry` 実装:
   - `create_run(...) -> Arc<RunCtx>`
   - `get_run(run_id) -> Option<Arc<RunCtx>>`
   - `list_runs(page_token, filters) -> page`
-- [ ] Run metadata:
+- [x] Run metadata:
   - created_at, updated_at
   - status（RUN_PENDING/RUN_RUNNING...）
   - hash_bundle（後で埋める）
-- [ ] page_token:
+- [x] page_token:
   - MVPは offset方式（base64("offset:123")）でOK
 
 ### DoD
@@ -158,6 +158,12 @@ CORE-002
 
 - [ ] SubmitRun → GetRun で `RUN_PENDING` or `RUN_RUNNING` が返る
 - [ ] ListRuns がページング形式（page_token）で最低限機能する（簡易でOK）
+
+### 進捗
+
+- [IN PROGRESS] In-memory RunRegistry と RunCtx/metadata を実装。
+- 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/engine/run.rs`。
+- 検証: `cargo test -p cork-store`, `cargo test -p cork-core`。
 
 ---
 

@@ -37,4 +37,3 @@ Before applying JCS, sort arrays that are semantically sets:
 ## Output
 Canonical JSON is a UTF-8 byte sequence.
 Hashing uses SHA-256 with domain separation.
-

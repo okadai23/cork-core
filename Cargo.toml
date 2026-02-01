@@ -26,6 +26,8 @@ tokio-stream = "0.1"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
 
 # internal crates
 cork-proto = { path = "crates/cork-proto" }

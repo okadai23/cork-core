@@ -26,4 +26,3 @@ Constraints:
 
 ## run_config_hash
 SHA256("CORK-RUNCFG\0" || contract_manifest_hash || "\0" || policy_hash)
-

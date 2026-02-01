@@ -12,3 +12,4 @@
 //! This is the skeleton implementation. Full implementation will be added in subsequent tasks.
 
 pub mod api;
+pub mod engine;
