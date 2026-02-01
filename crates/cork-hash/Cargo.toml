@@ -1,0 +1,6 @@
+[package]
+name = "cork-hash"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
