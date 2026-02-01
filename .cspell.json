@@ -4,8 +4,19 @@
   "words": [
     "clippy",
     "cork",
+    "corkd",
+    "FJSP",
+    "inmem",
+    "prenorm",
     "precommit",
-    "rustfmt"
+    "prost",
+    "protoc",
+    "replayability",
+    "rustfmt",
+    "RUNCFG",
+    "serde",
+    "subsec",
+    "canonicalizer"
   ],
   "ignorePaths": [
     "**/target/**",
