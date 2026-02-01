@@ -12,7 +12,8 @@ use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use cork_proto::cork::v1::{HashBundle, RunStatus};
+use cork_proto::cork::v1::{HashBundle, RunEvent, RunStatus};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -205,9 +206,78 @@ fn decode_page_token(token: Option<&str>) -> Option<usize> {
     offset.parse::<usize>().ok()
 }
 
+pub struct EventSubscription {
+    pub backlog: Vec<RunEvent>,
+    pub receiver: broadcast::Receiver<RunEvent>,
+}
+
+pub trait EventLog: Send + Sync {
+    fn append(&self, event: RunEvent) -> RunEvent;
+    fn subscribe(&self, since_seq: u64) -> EventSubscription;
+}
+
+#[derive(Debug)]
+pub struct InMemoryEventLog {
+    state: RwLock<EventLogState>,
+    sender: broadcast::Sender<RunEvent>,
+}
+
+#[derive(Debug)]
+struct EventLogState {
+    next_seq: u64,
+    events: Vec<RunEvent>,
+}
+
+impl InMemoryEventLog {
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(1024);
+        Self {
+            state: RwLock::new(EventLogState {
+                next_seq: 0,
+                events: Vec::new(),
+            }),
+            sender,
+        }
+    }
+}
+
+impl Default for InMemoryEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventLog for InMemoryEventLog {
+    fn append(&self, mut event: RunEvent) -> RunEvent {
+        let mut state = self.state.write().expect("event log lock poisoned");
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.saturating_add(1);
+        event.event_seq = seq as i64;
+        state.events.push(event.clone());
+        drop(state);
+        let _ = self.sender.send(event.clone());
+        event
+    }
+
+    fn subscribe(&self, since_seq: u64) -> EventSubscription {
+        let receiver = self.sender.subscribe();
+        let backlog = {
+            let state = self.state.read().expect("event log lock poisoned");
+            let start = usize::try_from(since_seq).unwrap_or(state.events.len());
+            if start >= state.events.len() {
+                Vec::new()
+            } else {
+                state.events[start..].to_vec()
+            }
+        };
+        EventSubscription { backlog, receiver }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn create_and_get_run() {
@@ -303,5 +373,34 @@ mod tests {
         let token = encode_page_token(42);
         let decoded = decode_page_token(Some(&token));
         assert_eq!(decoded, Some(42));
+    }
+
+    #[test]
+    fn append_assigns_contiguous_event_seq() {
+        let log = InMemoryEventLog::new();
+        let first = log.append(RunEvent::default());
+        let second = log.append(RunEvent::default());
+        assert_eq!(first.event_seq, 0);
+        assert_eq!(second.event_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_backlog_and_live_events() {
+        let log = InMemoryEventLog::new();
+        log.append(RunEvent::default());
+
+        let mut subscription = log.subscribe(0);
+        assert_eq!(subscription.backlog.len(), 1);
+        assert_eq!(subscription.backlog[0].event_seq, 0);
+
+        log.append(RunEvent::default());
+        let received = timeout(Duration::from_secs(1), subscription.receiver.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv failed");
+        assert_eq!(received.event_seq, 1);
+
+        let empty = log.subscribe(2);
+        assert!(empty.backlog.is_empty());
     }
 }

@@ -8,3 +8,4 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
 cork-proto = { workspace = true }
+tokio = { workspace = true }
