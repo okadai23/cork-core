@@ -276,13 +276,13 @@ CORE-010
 
 ### サブタスク
 
-- [ ] `prenorm_contract(Value) -> Value`（集合配列の安定ソート）
-- [ ] `prenorm_policy(Value) -> Value`
-- [ ] `prenorm_patch(Value) -> Value`（ops順序は保持・deps等のみソート）
-- [ ] `jcs_bytes(value) -> Vec<u8>`：`serde_json_canonicalizer::to_vec`採用
-- [ ] domain-separated hash:
+- [x] `prenorm_contract(Value) -> Value`（集合配列の安定ソート）
+- [x] `prenorm_policy(Value) -> Value`
+- [x] `prenorm_patch(Value) -> Value`（ops順序は保持・deps等のみソート）
+- [x] `jcs_bytes(value) -> Vec<u8>`：`serde_json_canonicalizer::to_vec`採用
+- [x] domain-separated hash:
   - prefix（"CORK-CONTRACT\0" 等）+ bytes を SHA-256
-- [ ] テスト:
+- [x] テスト:
   - フィールド順違いでも hash が一致
   - deps配列順違いでも一致（ソート対象のみ）
 
@@ -292,8 +292,14 @@ CORE-010
 
 ### Acceptance Criteria
 
-- [ ] フィールド順や空白差分があっても canonicalize 後の sha256 が一致する
-- [ ] 既知のテストベクタ（自作）で "ソート対象配列" が安定化している
+- [x] フィールド順や空白差分があっても canonicalize 後の sha256 が一致する
+- [x] 既知のテストベクタ（自作）で "ソート対象配列" が安定化している
+
+### 進捗
+
+- [DONE] CORE-020 canon/hash 実装とテストを追加。
+  - 変更ファイル: `crates/cork-canon/src/lib.rs`, `crates/cork-hash/src/lib.rs`, `crates/cork-canon/Cargo.toml`, `crates/cork-hash/Cargo.toml`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 ---
 

@@ -16,7 +16,18 @@
     "RUNCFG",
     "serde",
     "subsec",
-    "canonicalizer"
+    "canonicalizer",
+    "dashmap",
+    "Daisuke",
+    "dtolnay",
+    "MSVC",
+    "mpsc",
+    "rustc",
+    "rustup",
+    "Swatinem",
+    "tlsv",
+    "traceparent",
+    "tracestate"
   ],
   "ignorePaths": [
     "**/target/**",
