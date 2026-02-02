@@ -47,6 +47,16 @@ pub fn composite_hash(bytes: &[u8]) -> [u8; 32] {
     domain_hash(COMPOSITE_PREFIX, bytes)
 }
 
+pub fn composite_graph_hash(contract_hash: &[u8; 32], patch_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(32 + 1 + (patch_hashes.len() * 32));
+    bytes.extend_from_slice(contract_hash);
+    bytes.push(0);
+    for patch_hash in patch_hashes {
+        bytes.extend_from_slice(patch_hash);
+    }
+    composite_hash(&bytes)
+}
+
 pub fn run_config_hash(bytes: &[u8]) -> [u8; 32] {
     domain_hash(RUNCFG_PREFIX, bytes)
 }
@@ -232,5 +242,27 @@ mod tests {
         let bytes_a = jcs_bytes(&prenorm_patch(patch_a));
         let bytes_b = jcs_bytes(&prenorm_patch(patch_b));
         assert_eq!(patch_hash(&bytes_a), patch_hash(&bytes_b));
+    }
+
+    #[test]
+    fn composite_graph_hash_changes_with_patches() {
+        let contract_digest = contract_hash(b"contract");
+        let composite_empty = composite_graph_hash(&contract_digest, &[]);
+        let patch_digest = patch_hash(b"patch");
+        let composite_one = composite_graph_hash(&contract_digest, &[patch_digest]);
+        assert_ne!(composite_empty, composite_one);
+    }
+
+    #[test]
+    fn composite_graph_hash_matches_manual_concat() {
+        let contract_digest = contract_hash(b"contract");
+        let patch_digest = patch_hash(b"patch");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&contract_digest);
+        bytes.push(0);
+        bytes.extend_from_slice(&patch_digest);
+        let manual = composite_hash(&bytes);
+        let computed = composite_graph_hash(&contract_digest, &[patch_digest]);
+        assert_eq!(manual, computed);
     }
 }

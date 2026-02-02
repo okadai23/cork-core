@@ -30,6 +30,7 @@ serde_json_canonicalizer = "0.2"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+jsonschema = "0.40.2"
 
 # internal crates
 cork-proto = { path = "crates/cork-proto" }

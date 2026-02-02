@@ -20,6 +20,8 @@
     "dashmap",
     "Daisuke",
     "dtolnay",
+    "indegree",
+    "jsonschema",
     "MSVC",
     "mpsc",
     "rustc",
@@ -27,7 +29,8 @@
     "Swatinem",
     "tlsv",
     "traceparent",
-    "tracestate"
+    "tracestate",
+    "VecDeque"
   ],
   "ignorePaths": [
     "**/target/**",
