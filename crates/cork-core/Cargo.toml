@@ -9,8 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 cork-hash = { workspace = true }
+cork-schema = { workspace = true }
 cork-proto = { workspace = true }
 cork-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

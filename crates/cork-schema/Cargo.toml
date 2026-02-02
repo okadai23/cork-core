@@ -5,3 +5,4 @@ version.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+jsonschema = { workspace = true }

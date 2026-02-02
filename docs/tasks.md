@@ -321,9 +321,9 @@ CORE-020
 
 ### サブタスク
 
-- [ ] `patch_hash` を patch受理時に計算
-- [ ] `composite_hash = H(contract_hash || "\0" || patch_hash_0..N)`
-- [ ] RunStateに常に最新 hash_bundle を保持
+- [x] `patch_hash` を patch受理時に計算
+- [x] `composite_hash = H(contract_hash || "\0" || patch_hash_0..N)`
+- [x] RunStateに常に最新 hash_bundle を保持
 
 ### DoD
 
@@ -331,8 +331,14 @@ CORE-020
 
 ### Acceptance Criteria
 
-- [ ] patchが0件の時と、1件以上の時で hash が変わる
-- [ ] 同じ contract + 同じ patch列で、再計算して常に一致
+- [x] patchが0件の時と、1件以上の時で hash が変わる
+- [x] 同じ contract + 同じ patch列で、再計算して常に一致
+
+### 進捗
+
+- [DONE] Composite hash 更新ロジックと patch 受理時の hash_bundle 更新を追加。
+  - 変更ファイル: `crates/cork-hash/src/lib.rs`, `crates/cork-core/src/engine/patch.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 ---
 
@@ -356,14 +362,14 @@ CORE-020
 
 ### サブタスク
 
-- [ ] JSON Schema検証:
+- [x] JSON Schema検証:
   - `schemas/` を埋め込み or 起動時ロード
   - `jsonschema::draft202012::new(...)` でvalidator生成
-- [ ] 論理検証:
+- [x] 論理検証:
   - stage_id一意
   - dependencyの存在チェック
   - DAG判定（Kahn or DFSでcycle検出）
-- [ ] "実行順序用"にトポロジカル順を内部保持
+- [x] "実行順序用"にトポロジカル順を内部保持
 
 ### DoD
 
@@ -371,9 +377,15 @@ CORE-020
 
 ### Acceptance Criteria
 
-- [ ] cycleがあるmanifestは拒否
-- [ ] 存在しないstage参照は拒否
-- [ ] 正常manifestは stage order（トポロジカル順）を内部で保持できる
+- [x] cycleがあるmanifestは拒否
+- [x] 存在しないstage参照は拒否
+- [x] 正常manifestは stage order（トポロジカル順）を内部で保持できる
+
+### 進捗
+
+- [DONE] JSON Schema検証とDAG/参照チェックを実装し、トポロジカル順を保持。
+  - 変更ファイル: `crates/cork-schema/src/lib.rs`, `crates/cork-core/src/engine/run.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 ---
 
