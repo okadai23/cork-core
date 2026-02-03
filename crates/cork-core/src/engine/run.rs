@@ -281,11 +281,29 @@ fn collect_input_spec_refs(
     input_spec: &Value,
     refs: &mut Vec<ValueRef>,
 ) -> Result<(), String> {
-    let Some(obj) = input_spec.as_object() else {
+    let Some(_obj) = input_spec.as_object() else {
         return Err("input spec must be object".to_string());
     };
-    if let Some(value_ref) = obj.get("ref") {
-        refs.push(parse_value_ref(run_id, value_ref)?);
+    collect_value_refs(run_id, input_spec, refs)?;
+    Ok(())
+}
+
+fn collect_value_refs(run_id: &str, value: &Value, refs: &mut Vec<ValueRef>) -> Result<(), String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(value_ref) = map.get("ref") {
+                refs.push(parse_value_ref(run_id, value_ref)?);
+            }
+            for entry in map.values() {
+                collect_value_refs(run_id, entry, refs)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_value_refs(run_id, item, refs)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -775,6 +793,58 @@ mod tests {
             "stage-a/node-b",
             Vec::new(),
             tool_exec_with_ref(run_state_ref_value("/missing")),
+        );
+        let node_states = HashMap::new();
+        let stage_states = HashMap::from([(
+            "stage-a".to_string(),
+            StageRuntimeState {
+                status: StageRuntimeStatus::Committed,
+            },
+        )]);
+        let contract = ValidatedContractManifest {
+            stage_order: vec!["stage-a".to_string()],
+        };
+        let store = InMemoryStateStore::new();
+
+        let next = evaluate_node_readiness(
+            "run-1",
+            &node,
+            &pending_state(),
+            &node_states,
+            &stage_states,
+            &contract,
+            &store,
+        );
+        assert_eq!(next.status, NodeRuntimeStatus::Pending);
+        assert!(
+            next.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resolution failed")
+        );
+    }
+
+    #[test]
+    fn evaluate_node_readiness_blocks_on_nested_unresolved_refs() {
+        let node = node_spec(
+            "stage-a/node-b",
+            Vec::new(),
+            json!({
+                "tool": {
+                    "tool_name": "tool-a",
+                    "tool_version": "v1",
+                    "side_effect": "NONE",
+                    "input": {
+                        "query": {
+                            "ref": run_state_ref_value("/missing")
+                        },
+                        "filters": [
+                            "static",
+                            { "ref": run_state_ref_value("/also-missing") }
+                        ]
+                    }
+                }
+            }),
         );
         let node_states = HashMap::new();
         let stage_states = HashMap::from([(
