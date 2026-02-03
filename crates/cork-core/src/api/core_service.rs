@@ -13,7 +13,10 @@ use cork_proto::cork::v1::{
     GetLogsResponse, GetRunRequest, GetRunResponse, ListRunsRequest, ListRunsResponse, RunEvent,
     StreamRunEventsRequest, SubmitRunRequest, SubmitRunResponse, cork_core_server::CorkCore,
 };
-use cork_store::{EventLog, InMemoryEventLog};
+use cork_store::{
+    CreateRunInput, EventLog, InMemoryEventLog, InMemoryRunRegistry, RunCtx, RunRegistry,
+};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -21,15 +24,26 @@ use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tonic::{Request, Response, Status};
 
 /// The CorkCore service implementation.
-#[derive(Debug, Default)]
 pub struct CorkCoreService {
     event_logs: Arc<RwLock<HashMap<String, Arc<InMemoryEventLog>>>>,
+    run_registry: Arc<dyn RunRegistry>,
 }
 
 impl CorkCoreService {
     /// Creates a new CorkCoreService instance.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_run_registry(run_registry: Arc<dyn RunRegistry>) -> Self {
+        Self {
+            event_logs: Arc::new(RwLock::new(HashMap::new())),
+            run_registry,
+        }
+    }
+
+    pub fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx> {
+        self.run_registry.create_run(input)
     }
 
     fn event_log_for_run(&self, run_id: &str) -> Arc<InMemoryEventLog> {
@@ -43,12 +57,87 @@ impl CorkCoreService {
     }
 }
 
+impl Default for CorkCoreService {
+    fn default() -> Self {
+        Self {
+            event_logs: Arc::new(RwLock::new(HashMap::new())),
+            run_registry: Arc::new(InMemoryRunRegistry::new()),
+        }
+    }
+}
+
 enum Sha256Verification {
     MatchOrMissing,
     Mismatch {
         expected: [u8; 32],
         provided: Vec<u8>,
     },
+}
+
+#[derive(Debug)]
+enum GraphPatchRejectionReason {
+    Sha256Mismatch {
+        expected: String,
+        provided: String,
+    },
+    PatchSeqMismatch {
+        expected: u64,
+        provided: u64,
+    },
+    StageNotActive {
+        active_stage_id: Option<String>,
+        provided_stage_id: String,
+    },
+    MissingExpansionPolicy,
+    DynamicNodesNotAllowed,
+    NodeKindNotAllowed {
+        kind: String,
+    },
+    InvalidPatch {
+        message: String,
+    },
+}
+
+impl GraphPatchRejectionReason {
+    fn message(&self) -> String {
+        match self {
+            GraphPatchRejectionReason::Sha256Mismatch { expected, provided } => {
+                format!("sha256 mismatch (expected {expected}, provided {provided})")
+            }
+            GraphPatchRejectionReason::PatchSeqMismatch { expected, provided } => {
+                format!("patch_seq mismatch (expected {expected}, provided {provided})")
+            }
+            GraphPatchRejectionReason::StageNotActive {
+                active_stage_id,
+                provided_stage_id,
+            } => format!(
+                "stage_id not active (active {}, provided {provided_stage_id})",
+                active_stage_id
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            GraphPatchRejectionReason::MissingExpansionPolicy => {
+                "expansion_policy missing".to_string()
+            }
+            GraphPatchRejectionReason::DynamicNodesNotAllowed => {
+                "dynamic nodes not allowed in active stage".to_string()
+            }
+            GraphPatchRejectionReason::NodeKindNotAllowed { kind } => {
+                format!("node kind not allowed: {kind}")
+            }
+            GraphPatchRejectionReason::InvalidPatch { message } => {
+                format!("invalid patch: {message}")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GraphPatchMetadata {
+    patch_seq: u64,
+    stage_id: String,
+    node_kinds: Vec<String>,
+    has_node_added: bool,
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -79,6 +168,68 @@ fn verify_canonical_sha256(doc: &CanonicalJsonDocument) -> Result<Sha256Verifica
             expected: computed,
             provided: sha.bytes32.clone(),
         })
+    }
+}
+
+fn parse_graph_patch_metadata(
+    patch: &CanonicalJsonDocument,
+) -> Result<GraphPatchMetadata, GraphPatchRejectionReason> {
+    let value: Value = serde_json::from_slice(&patch.canonical_json_utf8).map_err(|err| {
+        GraphPatchRejectionReason::InvalidPatch {
+            message: err.to_string(),
+        }
+    })?;
+    let patch_seq = value
+        .get("patch_seq")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+            message: "patch_seq is missing or not an integer".to_string(),
+        })?;
+    let stage_id = value
+        .get("stage_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+            message: "stage_id is missing or not a string".to_string(),
+        })?
+        .to_string();
+    let ops = value
+        .get("ops")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+            message: "ops is missing or not an array".to_string(),
+        })?;
+
+    let mut node_kinds = Vec::new();
+    let mut has_node_added = false;
+    for op in ops {
+        let op_type = op.get("op_type").and_then(|value| value.as_str());
+        if op_type != Some("NODE_ADDED") {
+            continue;
+        }
+        has_node_added = true;
+        let kind = op
+            .get("node_added")
+            .and_then(|value| value.get("node"))
+            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                message: "node_added.node.kind is missing".to_string(),
+            })?;
+        node_kinds.push(kind.to_string());
+    }
+
+    Ok(GraphPatchMetadata {
+        patch_seq,
+        stage_id,
+        node_kinds,
+        has_node_added,
+    })
+}
+
+fn reject_response(reason: GraphPatchRejectionReason) -> ApplyGraphPatchResponse {
+    ApplyGraphPatchResponse {
+        accepted: false,
+        rejection_reason: reason.message(),
     }
 }
 
@@ -189,20 +340,63 @@ impl CorkCore for CorkCoreService {
         if handle.run_id.is_empty() {
             return Err(Status::invalid_argument("missing run_id"));
         }
+        let run_ctx = self
+            .run_registry
+            .get_run(&handle.run_id)
+            .ok_or_else(|| Status::not_found("run not found"))?;
         let patch = request
             .patch
             .ok_or_else(|| Status::invalid_argument("missing patch"))?;
         let verification = verify_canonical_sha256(&patch).map_err(|status| *status)?;
         if let Sha256Verification::Mismatch { expected, provided } = verification {
-            let rejection_reason = format!(
-                "sha256 mismatch (expected {}, provided {})",
-                bytes_to_hex(&expected),
-                bytes_to_hex(&provided)
-            );
-            return Ok(Response::new(ApplyGraphPatchResponse {
-                accepted: false,
-                rejection_reason,
-            }));
+            let rejection_reason = GraphPatchRejectionReason::Sha256Mismatch {
+                expected: bytes_to_hex(&expected),
+                provided: bytes_to_hex(&provided),
+            };
+            return Ok(Response::new(reject_response(rejection_reason)));
+        }
+        let metadata = match parse_graph_patch_metadata(&patch) {
+            Ok(metadata) => metadata,
+            Err(reason) => return Ok(Response::new(reject_response(reason))),
+        };
+        if run_ctx.active_stage_id().as_deref() != Some(&metadata.stage_id) {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::StageNotActive {
+                    active_stage_id: run_ctx.active_stage_id(),
+                    provided_stage_id: metadata.stage_id,
+                },
+            )));
+        }
+        let Some(expansion_policy) = run_ctx.active_stage_expansion_policy() else {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::MissingExpansionPolicy,
+            )));
+        };
+        if metadata.has_node_added && !expansion_policy.allow_dynamic {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::DynamicNodesNotAllowed,
+            )));
+        }
+        if metadata.has_node_added {
+            for kind in metadata.node_kinds {
+                if !expansion_policy
+                    .allow_kinds
+                    .iter()
+                    .any(|allowed| allowed == &kind)
+                {
+                    return Ok(Response::new(reject_response(
+                        GraphPatchRejectionReason::NodeKindNotAllowed { kind },
+                    )));
+                }
+            }
+        }
+        if let Err(expected) = run_ctx.try_advance_patch_seq(metadata.patch_seq) {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::PatchSeqMismatch {
+                    expected,
+                    provided: metadata.patch_seq,
+                },
+            )));
         }
         Ok(Response::new(ApplyGraphPatchResponse {
             accepted: true,
@@ -233,11 +427,76 @@ mod tests {
     use cork_proto::cork::v1::{
         ApplyGraphPatchRequest, CanonicalJsonDocument, RunHandle, Sha256, StreamRunEventsRequest,
     };
+    use cork_store::{CreateRunInput, ExpansionPolicy, InMemoryRunRegistry, RunRegistry};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
 
     fn build_sha256(bytes: &[u8]) -> Sha256 {
         Sha256 {
             bytes32: bytes.to_vec(),
         }
+    }
+
+    fn build_patch_document(
+        run_id: &str,
+        patch_seq: u64,
+        stage_id: &str,
+        ops: Value,
+    ) -> CanonicalJsonDocument {
+        let payload = json!({
+            "schema_version": "cork.graph_patch.v0.1",
+            "run_id": run_id,
+            "patch_seq": patch_seq,
+            "stage_id": stage_id,
+            "ops": ops,
+        });
+        let canonical_json_utf8 = serde_json::to_vec(&payload).expect("serialize patch payload");
+        let digest = sha256(&canonical_json_utf8);
+        CanonicalJsonDocument {
+            canonical_json_utf8,
+            sha256: Some(build_sha256(&digest)),
+            schema_id: "cork.graph_patch.v0.1".to_string(),
+        }
+    }
+
+    fn node_added_op(kind: &str) -> Value {
+        json!({
+            "op_type": "NODE_ADDED",
+            "node_added": {
+                "node": {
+                    "node_id": "node-1",
+                    "kind": kind,
+                    "anchor_position": "WITHIN",
+                    "deps": [],
+                    "exec": { "llm": { "provider": "test", "model": "test", "messages": [ { "role": "user", "parts": [ { "text": "hi" } ] } ] } }
+                }
+            }
+        })
+    }
+
+    fn setup_service_with_run(
+        active_stage_id: &str,
+        allow_dynamic: bool,
+        allow_kinds: Vec<&str>,
+        next_patch_seq: u64,
+    ) -> (CorkCoreService, RunHandle) {
+        let registry: Arc<dyn RunRegistry> = Arc::new(InMemoryRunRegistry::new());
+        let service = CorkCoreService::with_run_registry(Arc::clone(&registry));
+        let run = registry.create_run(CreateRunInput {
+            active_stage_id: Some(active_stage_id.to_string()),
+            active_stage_expansion_policy: Some(ExpansionPolicy {
+                allow_dynamic,
+                allow_kinds: allow_kinds.into_iter().map(str::to_string).collect(),
+            }),
+            next_patch_seq: Some(next_patch_seq),
+            ..Default::default()
+        });
+        (
+            service,
+            RunHandle {
+                run_id: run.run_id().to_string(),
+            },
+        )
     }
 
     #[tokio::test]
@@ -277,18 +536,17 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_sha256_mismatch() {
-        let service = CorkCoreService::new();
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch =
+            build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("LLM")]));
         let patch = CanonicalJsonDocument {
-            canonical_json_utf8: br#"{"op":"noop"}"#.to_vec(),
             sha256: Some(Sha256 {
                 bytes32: vec![0u8; 32],
             }),
-            schema_id: "cork.graph_patch.v0.1".to_string(),
+            ..patch
         };
         let request = ApplyGraphPatchRequest {
-            handle: Some(RunHandle {
-                run_id: "run-1".to_string(),
-            }),
+            handle: Some(handle),
             patch: Some(patch),
             actor_id: String::new(),
         };
@@ -307,18 +565,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_accepts_matching_sha256() {
-        let service = CorkCoreService::new();
-        let payload = br#"{"op":"noop"}"#.to_vec();
-        let digest = sha256(&payload);
-        let patch = CanonicalJsonDocument {
-            canonical_json_utf8: payload,
-            sha256: Some(build_sha256(&digest)),
-            schema_id: "cork.graph_patch.v0.1".to_string(),
-        };
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch =
+            build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("LLM")]));
         let request = ApplyGraphPatchRequest {
-            handle: Some(RunHandle {
-                run_id: "run-1".to_string(),
-            }),
+            handle: Some(handle),
             patch: Some(patch),
             actor_id: String::new(),
         };
@@ -329,5 +580,77 @@ mod tests {
             .into_inner();
         assert!(response.accepted);
         assert!(response.rejection_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_patch_seq_gap() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch =
+            build_patch_document(&handle.run_id, 2, "stage-a", json!([node_added_op("LLM")]));
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("patch_seq mismatch"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_inactive_stage() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch =
+            build_patch_document(&handle.run_id, 0, "stage-b", json!([node_added_op("LLM")]));
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("stage_id not active"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_disallowed_node_kind() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch =
+            build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("TOOL")]));
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("node kind not allowed"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
     }
 }

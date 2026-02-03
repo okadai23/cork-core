@@ -23,6 +23,7 @@ impl PatchTracker {
     pub fn apply_patch(&mut self, run_ctx: &RunCtx, patch_bytes: &[u8]) -> HashBundle {
         let digest = patch_hash(patch_bytes);
         self.patch_hashes.push(digest);
+        run_ctx.advance_patch_seq();
         self.update_hash_bundle(run_ctx)
     }
 

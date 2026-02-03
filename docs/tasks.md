@@ -449,11 +449,11 @@ CORE-022, CORE-010
 
 ### サブタスク
 
-- [ ] RunCtxに `next_patch_seq` を保持
-- [ ] patch_seq != next_patch_seq → 拒否（厳密連番）
-- [ ] patch.stage_id が ACTIVE stage かチェック
-- [ ] expansion_policy.allow_dynamic / allow_kinds をチェック
-- [ ] 拒否理由をenum化（後でCORE-043で整理）
+- [x] RunCtxに `next_patch_seq` を保持
+- [x] patch_seq != next_patch_seq → 拒否（厳密連番）
+- [x] patch.stage_id が ACTIVE stage かチェック
+- [x] expansion_policy.allow_dynamic / allow_kinds をチェック
+- [x] 拒否理由をenum化（後でCORE-043で整理）
 
 ### DoD
 
@@ -461,10 +461,17 @@ CORE-022, CORE-010
 
 ### Acceptance Criteria
 
-- [ ] patch_seq=0 が最初に来ない場合は拒否
-- [ ] 0→2 が来たら拒否
-- [ ] ACTIVEでないstage_idのpatchは拒否
-- [ ] allow_kindsにないkindのNODE_ADDEDは拒否
+- [x] patch_seq=0 が最初に来ない場合は拒否
+- [x] 0→2 が来たら拒否
+- [x] ACTIVEでないstage_idのpatchは拒否
+- [x] allow_kindsにないkindのNODE_ADDEDは拒否
+
+### 進捗
+
+- [DONE] ApplyGraphPatchの検証とRunCtx拡張を実装。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-core/src/engine/patch.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`。
+  - 追記: patch_seq の原子比較/更新を追加。
 
 ---
 

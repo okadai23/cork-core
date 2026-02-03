@@ -17,7 +17,7 @@ pub fn run_ctx_to_response(run_ctx: &Arc<RunCtx>) -> GetRunResponse {
         created_at: Some(system_time_to_timestamp(metadata.created_at)),
         updated_at: Some(system_time_to_timestamp(metadata.updated_at)),
         hashes: metadata.hash_bundle,
-        active_stage_id: String::new(),
+        active_stage_id: metadata.active_stage_id.unwrap_or_default(),
     }
 }
 
@@ -342,6 +342,9 @@ mod tests {
             status: Some(RunStatus::RunRunning),
             hash_bundle: None,
             stage_auto_commit: None,
+            next_patch_seq: None,
+            active_stage_id: None,
+            active_stage_expansion_policy: None,
         });
 
         let response = run_ctx_to_response(&run);
@@ -375,6 +378,9 @@ mod tests {
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
             stage_auto_commit: None,
+            next_patch_seq: None,
+            active_stage_id: None,
+            active_stage_expansion_policy: None,
         });
         registry.create_run(CreateRunInput {
             experiment_id: Some("exp-2".to_string()),
@@ -382,6 +388,9 @@ mod tests {
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
             stage_auto_commit: None,
+            next_patch_seq: None,
+            active_stage_id: None,
+            active_stage_expansion_policy: None,
         });
 
         let page = registry.list_runs(
