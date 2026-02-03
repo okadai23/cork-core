@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use cork_proto::cork::v1::{HashBundle, RunEvent, RunStatus};
+use cork_proto::cork::v1::{HashBundle, LogRecord, RunEvent, RunStatus};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -816,6 +816,165 @@ impl EventLog for InMemoryEventLog {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LogFilters {
+    pub scope_id: Option<String>,
+    pub span_id_hex: Option<String>,
+    pub stage_id: Option<String>,
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogPage {
+    pub logs: Vec<LogRecord>,
+    pub next_page_token: Option<String>,
+}
+
+pub trait LogStore: Send + Sync {
+    fn append_log(&self, run_id: &str, stage_id: &str, node_id: &str, log: LogRecord) -> LogRecord;
+    fn list_logs(
+        &self,
+        run_id: &str,
+        page_token: Option<&str>,
+        filters: LogFilters,
+        page_size: usize,
+    ) -> LogPage;
+}
+
+#[derive(Debug)]
+pub struct InMemoryLogStore {
+    runs: RwLock<HashMap<String, RunLogState>>,
+}
+
+#[derive(Debug)]
+struct RunLogState {
+    logs: Vec<LogRecord>,
+    next_scope_seq: HashMap<String, u64>,
+}
+
+impl InMemoryLogStore {
+    pub fn new() -> Self {
+        Self {
+            runs: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn ensure_scope_id(run_id: &str, stage_id: &str, node_id: &str, log: &LogRecord) -> String {
+        if !log.scope_id.is_empty() {
+            return log.scope_id.clone();
+        }
+        if !stage_id.is_empty() || !node_id.is_empty() {
+            return format!("{stage_id}:{node_id}");
+        }
+        run_id.to_string()
+    }
+
+    fn ensure_attrs(attrs: &mut HashMap<String, String>, stage_id: &str, node_id: &str) {
+        if !stage_id.is_empty() {
+            attrs
+                .entry("stage_id".to_string())
+                .or_insert_with(|| stage_id.to_string());
+        }
+        if !node_id.is_empty() {
+            attrs
+                .entry("node_id".to_string())
+                .or_insert_with(|| node_id.to_string());
+        }
+    }
+}
+
+impl Default for InMemoryLogStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogStore for InMemoryLogStore {
+    fn append_log(
+        &self,
+        run_id: &str,
+        stage_id: &str,
+        node_id: &str,
+        mut log: LogRecord,
+    ) -> LogRecord {
+        let mut runs = self.runs.write().expect("log store lock poisoned");
+        let state = runs
+            .entry(run_id.to_string())
+            .or_insert_with(|| RunLogState {
+                logs: Vec::new(),
+                next_scope_seq: HashMap::new(),
+            });
+
+        let scope_id = Self::ensure_scope_id(run_id, stage_id, node_id, &log);
+        let seq = state.next_scope_seq.entry(scope_id.clone()).or_insert(0);
+        log.scope_id = scope_id;
+        log.scope_seq = *seq as i64;
+        *seq = seq.saturating_add(1);
+        Self::ensure_attrs(&mut log.attrs, stage_id, node_id);
+        state.logs.push(log.clone());
+        log
+    }
+
+    fn list_logs(
+        &self,
+        run_id: &str,
+        page_token: Option<&str>,
+        filters: LogFilters,
+        page_size: usize,
+    ) -> LogPage {
+        let runs = self.runs.read().expect("log store lock poisoned");
+        let state = match runs.get(run_id) {
+            Some(state) => state,
+            None => {
+                return LogPage {
+                    logs: Vec::new(),
+                    next_page_token: None,
+                };
+            }
+        };
+
+        let mut filtered = Vec::new();
+        for log in &state.logs {
+            if let Some(ref scope_id) = filters.scope_id
+                && &log.scope_id != scope_id
+            {
+                continue;
+            }
+            if let Some(ref span_id) = filters.span_id_hex
+                && &log.span_id_hex != span_id
+            {
+                continue;
+            }
+            if let Some(ref stage_id) = filters.stage_id
+                && log.attrs.get("stage_id") != Some(stage_id)
+            {
+                continue;
+            }
+            if let Some(ref node_id) = filters.node_id
+                && log.attrs.get("node_id") != Some(node_id)
+            {
+                continue;
+            }
+            filtered.push(log.clone());
+        }
+
+        let offset = decode_page_token(page_token).unwrap_or(0);
+        let total = filtered.len();
+        let start = offset.min(total);
+        let end = (start + page_size).min(total);
+        let next_page_token = if end < total {
+            Some(encode_page_token(end))
+        } else {
+            None
+        };
+
+        LogPage {
+            logs: filtered[start..end].to_vec(),
+            next_page_token,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +1107,78 @@ mod tests {
         let second = log.append(RunEvent::default());
         assert_eq!(first.event_seq, 0);
         assert_eq!(second.event_seq, 1);
+    }
+
+    #[test]
+    fn log_store_assigns_scope_seq_and_filters() {
+        let store = InMemoryLogStore::new();
+        let run_id = "run-1";
+        let log_a = LogRecord {
+            level: "INFO".to_string(),
+            message: "first".to_string(),
+            trace_id_hex: "trace-a".to_string(),
+            span_id_hex: "span-a".to_string(),
+            scope_id: "".to_string(),
+            scope_seq: 0,
+            attrs: Default::default(),
+            ts: None,
+        };
+        let log_b = LogRecord {
+            level: "INFO".to_string(),
+            message: "second".to_string(),
+            trace_id_hex: "trace-a".to_string(),
+            span_id_hex: "span-a".to_string(),
+            scope_id: "".to_string(),
+            scope_seq: 0,
+            attrs: Default::default(),
+            ts: None,
+        };
+
+        let stored_a = store.append_log(run_id, "stage-a", "node-a", log_a);
+        let stored_b = store.append_log(run_id, "stage-a", "node-a", log_b);
+        assert_eq!(stored_a.scope_seq, 0);
+        assert_eq!(stored_b.scope_seq, 1);
+        assert_eq!(stored_a.scope_id, stored_b.scope_id);
+
+        let page = store.list_logs(
+            run_id,
+            None,
+            LogFilters {
+                scope_id: Some(stored_a.scope_id.clone()),
+                span_id_hex: None,
+                stage_id: Some("stage-a".to_string()),
+                node_id: Some("node-a".to_string()),
+            },
+            10,
+        );
+        assert_eq!(page.logs.len(), 2);
+    }
+
+    #[test]
+    fn log_store_paginates() {
+        let store = InMemoryLogStore::new();
+        let run_id = "run-2";
+        for idx in 0..3 {
+            let log = LogRecord {
+                level: "INFO".to_string(),
+                message: format!("log-{idx}"),
+                trace_id_hex: "".to_string(),
+                span_id_hex: "".to_string(),
+                scope_id: "".to_string(),
+                scope_seq: 0,
+                attrs: Default::default(),
+                ts: None,
+            };
+            store.append_log(run_id, "stage", "node", log);
+        }
+
+        let first_page = store.list_logs(run_id, None, LogFilters::default(), 2);
+        assert_eq!(first_page.logs.len(), 2);
+        let token = first_page.next_page_token.expect("next token");
+
+        let second_page = store.list_logs(run_id, Some(&token), LogFilters::default(), 2);
+        assert_eq!(second_page.logs.len(), 1);
+        assert!(second_page.next_page_token.is_none());
     }
 
     #[tokio::test]

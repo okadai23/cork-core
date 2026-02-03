@@ -7,7 +7,7 @@ use cork_proto::cork::v1::{
     ArtifactRef as ProtoArtifactRef, InvokeToolRequest, InvokeToolResponse, InvokeToolStreamChunk,
     LogRecord, NodeStateChanged, NodeStatus, Payload, RunEvent, TraceContext,
 };
-use cork_store::{ArtifactRef, EventLog, NodeOutput, NodePayload, StateStore};
+use cork_store::{ArtifactRef, EventLog, LogStore, NodeOutput, NodePayload, StateStore};
 use prost_types::Timestamp;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
@@ -50,6 +50,7 @@ pub struct InvocationContext<'a> {
     pub stage_id: &'a str,
     pub node_id: &'a str,
     pub event_log: &'a dyn EventLog,
+    pub log_store: &'a dyn LogStore,
     pub state_store: &'a dyn StateStore,
     pub budget: InvocationBudget,
     pub trace_context: Option<TraceContext>,
@@ -165,7 +166,15 @@ fn handle_chunk(
 ) -> Option<InvokeToolResponse> {
     match &chunk.chunk {
         Some(Chunk::Log(log)) => {
-            append_log(context.event_log, log.clone(), chunk.ts);
+            append_log(
+                context.event_log,
+                context.log_store,
+                context.run_id,
+                context.stage_id,
+                context.node_id,
+                log.clone(),
+                chunk.ts,
+            );
             None
         }
         Some(Chunk::Final(response)) => Some(response.clone()),
@@ -234,8 +243,17 @@ fn artifact_from_proto(artifact: &ProtoArtifactRef) -> ArtifactRef {
     }
 }
 
-fn append_log(event_log: &dyn EventLog, log: LogRecord, ts: Option<Timestamp>) {
+fn append_log(
+    event_log: &dyn EventLog,
+    log_store: &dyn LogStore,
+    run_id: &str,
+    stage_id: &str,
+    node_id: &str,
+    log: LogRecord,
+    ts: Option<Timestamp>,
+) {
     let timestamp = ts.or(log.ts).unwrap_or_else(now_timestamp);
+    let log = log_store.append_log(run_id, stage_id, node_id, log);
     let event = RunEvent {
         event_seq: 0,
         ts: Some(timestamp),
@@ -308,7 +326,7 @@ mod tests {
     use super::*;
     use cork_proto::cork::v1::cork_worker_server::{CorkWorker, CorkWorkerServer};
     use cork_proto::cork::v1::{InvokeToolRequest, InvokeToolResponse};
-    use cork_store::{InMemoryEventLog, InMemoryStateStore};
+    use cork_store::{InMemoryEventLog, InMemoryLogStore, InMemoryStateStore};
     use std::pin::Pin;
     use tokio::net::TcpListener;
     use tokio_stream::Stream;
@@ -458,12 +476,14 @@ mod tests {
         let (channel, handle) = start_test_server().await;
         let mut client = WorkerClient::new(channel);
         let event_log = InMemoryEventLog::new();
+        let log_store = InMemoryLogStore::new();
         let state_store = InMemoryStateStore::new();
         let context = InvocationContext {
             run_id: "run-1",
             stage_id: "stage-a",
             node_id: "stage-a/node-a",
             event_log: &event_log,
+            log_store: &log_store,
             state_store: &state_store,
             budget: InvocationBudget::default(),
             trace_context: None,
@@ -502,12 +522,14 @@ mod tests {
         let (channel, handle) = start_test_server().await;
         let mut client = WorkerClient::new(channel);
         let event_log = InMemoryEventLog::new();
+        let log_store = InMemoryLogStore::new();
         let state_store = InMemoryStateStore::new();
         let context = InvocationContext {
             run_id: "run-2",
             stage_id: "stage-b",
             node_id: "stage-b/node-b",
             event_log: &event_log,
+            log_store: &log_store,
             state_store: &state_store,
             budget: InvocationBudget::default(),
             trace_context: None,
