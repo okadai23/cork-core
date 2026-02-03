@@ -726,15 +726,15 @@ CORE-023, CORE-026
 
 ### サブタスク
 
-- [ ] ResourceId命名規約を実装:
+- [x] ResourceId命名規約を実装:
   - `cpu`, `io`, `provider:<id>`, `tool:<name>`, `machine:<id>`
-- [ ] `Semaphore` ベースの予約:
+- [x] `Semaphore` ベースの予約:
   - capacityに応じてpermitを取る
-- [ ] alternatives（FJSP準備）:
+- [x] alternatives（FJSP準備）:
   - MVPでは `alternatives` があれば "最初に取れるもの" を選ぶ（後で最適化）
-- [ ] 解放:
+- [x] 解放:
   - Node終了時にpermits返却
-- [ ] テスト:
+- [x] テスト:
   - capacity=1 の排他が効く
 
 ### DoD
@@ -743,9 +743,18 @@ CORE-023, CORE-026
 
 ### Acceptance Criteria
 
-- [ ] cpu_max=1 のとき同時に2つRUNNINGにしない
-- [ ] provider:openai の max_concurrency に従い入場制御できる
-- [ ] EXCLUSIVE resource（machine:x）を同時に2つ取れない
+- [x] cpu_max=1 のとき同時に2つRUNNINGにしない
+- [x] provider:openai の max_concurrency に従い入場制御できる
+- [x] EXCLUSIVE resource（machine:x）を同時に2つ取れない
+
+### 進捗
+
+- [DONE] ResourceManagerのプール初期化、予約/解放、alternatives選択の実装とユニットテストを追加。
+  - 変更ファイル: `crates/cork-core/src/scheduler/resource.rs`, `crates/cork-core/src/scheduler/mod.rs`, `crates/cork-core/src/lib.rs`, `docs/tasks.md`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] リクエスト量がプール容量を超える場合に恒久的エラーで返すよう修正し、容量超過テストを追加。
+  - 変更ファイル: `crates/cork-core/src/scheduler/resource.rs`, `docs/tasks.md`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
