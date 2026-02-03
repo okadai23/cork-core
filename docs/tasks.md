@@ -701,6 +701,9 @@ CORE-030, CORE-022
 - [DONE] READY判定の評価ロジックとRuntimeState構造体を追加し、deps/ref/stage順序の判定テストを実装。
 - 変更ファイル: `crates/cork-core/src/engine/run.rs`、`docs/tasks.md`。
 - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] tool input内の入れ子refを再帰的に収集するよう修正し、READY判定のテストを追加。
+  - 変更ファイル: `crates/cork-core/src/engine/run.rs`、`docs/tasks.md`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
