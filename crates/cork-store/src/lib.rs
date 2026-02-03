@@ -24,6 +24,15 @@ pub struct RunMetadata {
     pub hash_bundle: Option<HashBundle>,
     pub experiment_id: Option<String>,
     pub variant_id: Option<String>,
+    pub stage_auto_commit: Option<StageAutoCommitPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageAutoCommitPolicy {
+    pub enabled: bool,
+    pub quiescence_ms: u64,
+    pub max_open_ms: u64,
+    pub exclude_when_waiting: bool,
 }
 
 #[derive(Debug)]
@@ -51,6 +60,14 @@ impl RunCtx {
             .clone()
     }
 
+    pub fn stage_auto_commit(&self) -> Option<StageAutoCommitPolicy> {
+        self.metadata
+            .read()
+            .expect("run metadata lock poisoned")
+            .stage_auto_commit
+            .clone()
+    }
+
     pub fn set_status(&self, status: RunStatus) {
         let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
         metadata.status = status;
@@ -70,6 +87,7 @@ pub struct CreateRunInput {
     pub variant_id: Option<String>,
     pub status: Option<RunStatus>,
     pub hash_bundle: Option<HashBundle>,
+    pub stage_auto_commit: Option<StageAutoCommitPolicy>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,6 +138,7 @@ impl RunRegistry for InMemoryRunRegistry {
             hash_bundle: input.hash_bundle,
             experiment_id: input.experiment_id,
             variant_id: input.variant_id,
+            stage_auto_commit: input.stage_auto_commit,
         };
         let run_ctx = Arc::new(RunCtx::new(run_id.clone(), metadata));
 
@@ -287,6 +306,12 @@ mod tests {
             variant_id: Some("var-1".to_string()),
             status: None,
             hash_bundle: None,
+            stage_auto_commit: Some(StageAutoCommitPolicy {
+                enabled: true,
+                quiescence_ms: 10,
+                max_open_ms: 20,
+                exclude_when_waiting: false,
+            }),
         });
 
         let fetched = registry.get_run(run.run_id()).expect("run exists");
@@ -301,6 +326,15 @@ mod tests {
                 .duration_since(metadata.created_at)
                 .is_ok()
         );
+        assert_eq!(
+            run.stage_auto_commit(),
+            Some(StageAutoCommitPolicy {
+                enabled: true,
+                quiescence_ms: 10,
+                max_open_ms: 20,
+                exclude_when_waiting: false,
+            })
+        );
     }
 
     #[test]
@@ -311,18 +345,21 @@ mod tests {
             variant_id: None,
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
+            stage_auto_commit: None,
         });
         let _run_b = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-1".to_string()),
             variant_id: None,
             status: Some(RunStatus::RunRunning),
             hash_bundle: None,
+            stage_auto_commit: None,
         });
         let run_c = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-2".to_string()),
             variant_id: None,
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
+            stage_auto_commit: None,
         });
 
         let page1 = registry.list_runs(

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cork_proto::cork::v1::{GetRunResponse, RunHandle, RunStatus};
-use cork_store::{RunCtx, RunRegistry};
+use cork_store::{RunCtx, RunRegistry, StageAutoCommitPolicy};
 use prost_types::Timestamp;
 use serde_json::Value;
 
@@ -56,6 +56,39 @@ pub enum ContractManifestError {
     CycleDetected,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerMode {
+    ListHeuristic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourcePoolKind {
+    Cumulative,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePoolSpec {
+    pub resource_id: String,
+    pub capacity: u64,
+    pub kind: ResourcePoolKind,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedPolicy {
+    pub resource_pools: Vec<ResourcePoolSpec>,
+    pub scheduler_mode: SchedulerMode,
+    pub stage_auto_commit: StageAutoCommitPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyError {
+    Schema(String),
+    DuplicateResourceId(String),
+    UnsupportedSchedulerMode(String),
+}
+
 pub fn validate_contract_manifest(
     value: &Value,
 ) -> Result<ValidatedContractManifest, ContractManifestError> {
@@ -63,6 +96,18 @@ pub fn validate_contract_manifest(
         .map_err(|err| ContractManifestError::Schema(format!("{err:?}")))?;
     let stage_order = validate_contract_graph(value)?;
     Ok(ValidatedContractManifest { stage_order })
+}
+
+pub fn validate_policy(value: &Value) -> Result<ValidatedPolicy, PolicyError> {
+    cork_schema::validate_policy(value).map_err(|err| PolicyError::Schema(format!("{err:?}")))?;
+    let resource_pools = parse_resource_pools(value)?;
+    let scheduler_mode = parse_scheduler_mode(value)?;
+    let stage_auto_commit = parse_stage_auto_commit(value)?;
+    Ok(ValidatedPolicy {
+        resource_pools,
+        scheduler_mode,
+        stage_auto_commit,
+    })
 }
 
 fn validate_contract_graph(value: &Value) -> Result<Vec<String>, ContractManifestError> {
@@ -175,6 +220,113 @@ fn validate_contract_graph(value: &Value) -> Result<Vec<String>, ContractManifes
     Ok(order)
 }
 
+fn parse_resource_pools(value: &Value) -> Result<Vec<ResourcePoolSpec>, PolicyError> {
+    let pools = value
+        .get("resource_pools")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut seen = HashSet::new();
+    let mut specs = Vec::with_capacity(pools.len());
+
+    for pool in pools {
+        let pool_obj = pool.as_object().ok_or_else(|| {
+            PolicyError::Schema("resource_pools entry must be object".to_string())
+        })?;
+        let resource_id = pool_obj
+            .get("resource_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| PolicyError::Schema("resource_id is missing".to_string()))?;
+        if !seen.insert(resource_id.to_string()) {
+            return Err(PolicyError::DuplicateResourceId(resource_id.to_string()));
+        }
+        let capacity = pool_obj
+            .get("capacity")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| PolicyError::Schema("capacity is missing".to_string()))?;
+        let kind = match pool_obj
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| PolicyError::Schema("kind is missing".to_string()))?
+        {
+            "CUMULATIVE" => ResourcePoolKind::Cumulative,
+            "EXCLUSIVE" => ResourcePoolKind::Exclusive,
+            other => return Err(PolicyError::Schema(format!("unknown kind {other}"))),
+        };
+        let tags = pool_obj
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .map(|tags| {
+                tags.iter()
+                    .map(|tag| {
+                        tag.as_str().map(str::to_string).ok_or_else(|| {
+                            PolicyError::Schema("resource_pools.tags must be strings".to_string())
+                        })
+                    })
+                    .collect::<Result<Vec<String>, PolicyError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        specs.push(ResourcePoolSpec {
+            resource_id: resource_id.to_string(),
+            capacity,
+            kind,
+            tags,
+        });
+    }
+
+    specs.sort_by(|a, b| a.resource_id.cmp(&b.resource_id));
+    Ok(specs)
+}
+
+fn parse_scheduler_mode(value: &Value) -> Result<SchedulerMode, PolicyError> {
+    let mode = value
+        .get("scheduler")
+        .and_then(|scheduler| scheduler.get("mode"))
+        .and_then(|mode| mode.as_str())
+        .ok_or_else(|| PolicyError::Schema("scheduler.mode is missing".to_string()))?;
+    match mode {
+        "LIST_HEURISTIC" => Ok(SchedulerMode::ListHeuristic),
+        other => Err(PolicyError::UnsupportedSchedulerMode(other.to_string())),
+    }
+}
+
+fn parse_stage_auto_commit(value: &Value) -> Result<StageAutoCommitPolicy, PolicyError> {
+    let auto_commit = value
+        .get("stage_auto_commit")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| PolicyError::Schema("stage_auto_commit is missing".to_string()))?;
+    let enabled = auto_commit
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| PolicyError::Schema("stage_auto_commit.enabled is missing".to_string()))?;
+    let quiescence_ms = auto_commit
+        .get("quiescence_ms")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            PolicyError::Schema("stage_auto_commit.quiescence_ms is missing".to_string())
+        })?;
+    let max_open_ms = auto_commit
+        .get("max_open_ms")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            PolicyError::Schema("stage_auto_commit.max_open_ms is missing".to_string())
+        })?;
+    let exclude_when_waiting = auto_commit
+        .get("exclude_when_waiting")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            PolicyError::Schema("stage_auto_commit.exclude_when_waiting is missing".to_string())
+        })?;
+    Ok(StageAutoCommitPolicy {
+        enabled,
+        quiescence_ms,
+        max_open_ms,
+        exclude_when_waiting,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +341,7 @@ mod tests {
             variant_id: Some("var".to_string()),
             status: Some(RunStatus::RunRunning),
             hash_bundle: None,
+            stage_auto_commit: None,
         });
 
         let response = run_ctx_to_response(&run);
@@ -221,12 +374,14 @@ mod tests {
             variant_id: None,
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
+            stage_auto_commit: None,
         });
         registry.create_run(CreateRunInput {
             experiment_id: Some("exp-2".to_string()),
             variant_id: None,
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
+            stage_auto_commit: None,
         });
 
         let page = registry.list_runs(
@@ -338,5 +493,175 @@ mod tests {
 
         let result = validate_contract_manifest(&manifest);
         assert!(matches!(result, Err(ContractManifestError::CycleDetected)));
+    }
+
+    fn build_policy() -> serde_json::Value {
+        json!({
+            "schema_version": "cork.policy.v0.1",
+            "policy_id": "policy-1234",
+            "run_budget": {
+                "wall_ms": 1000,
+                "deadline_mode": "RELATIVE",
+                "deadline_ms": 1000,
+                "tokens_in_max": 100,
+                "tokens_out_max": 0,
+                "cost_usd_max": 0.0,
+                "max_steps": 1,
+                "max_dynamic_nodes": 0,
+                "history_max_events": 100,
+                "history_max_bytes": 1024
+            },
+            "concurrency": {
+                "io_max": 1,
+                "cpu_max": 1,
+                "per_stage_max": 1,
+                "per_provider_max": 1
+            },
+            "retry": {
+                "max_attempts": 0,
+                "backoff": {
+                    "policy": "CONSTANT",
+                    "base_delay_ms": 0,
+                    "max_delay_ms": 0,
+                    "jitter": "NONE"
+                },
+                "retry_on": [],
+                "respect_retry_after": false,
+                "circuit_breaker": {
+                    "enabled": false,
+                    "open_after_failures": 1,
+                    "half_open_after_ms": 100
+                }
+            },
+            "rate_limit": {
+                "providers": []
+            },
+            "idle": {
+                "heartbeat_interval_ms": 100,
+                "idle_timeout_ms": 1000
+            },
+            "guardrails": {
+                "store_prompts": "none",
+                "store_completions": "none",
+                "store_tool_io": "none",
+                "pre_call": [],
+                "during_call": [],
+                "post_call": [],
+                "on_violation": {
+                    "action": "BLOCK",
+                    "max_retries": 0
+                }
+            },
+            "context": {
+                "token_counter": {
+                    "impl": "default",
+                    "strict_mode": false
+                },
+                "compression": {
+                    "enabled": false,
+                    "steps": []
+                }
+            },
+            "cache": {
+                "enabled": false,
+                "default_ttl_ms": 0,
+                "rules": []
+            },
+            "loop_detection": {
+                "max_steps": 1,
+                "max_dynamic_nodes": 0,
+                "no_progress": {
+                    "enabled": false,
+                    "repeat_threshold": 2,
+                    "fingerprint_keys": []
+                }
+            },
+            "retention": {
+                "event_log_ttl_ms": 0,
+                "artifact_ttl_ms": 0,
+                "trace_ttl_ms": 0
+            },
+            "scheduler": {
+                "mode": "LIST_HEURISTIC",
+                "tie_break": "FIFO"
+            },
+            "stage_auto_commit": {
+                "enabled": true,
+                "quiescence_ms": 10,
+                "max_open_ms": 20,
+                "exclude_when_waiting": false
+            },
+            "resource_pools": [
+                {
+                    "resource_id": "pool-2",
+                    "capacity": 2,
+                    "kind": "EXCLUSIVE",
+                    "tags": ["gpu"]
+                },
+                {
+                    "resource_id": "pool-1",
+                    "capacity": 1,
+                    "kind": "CUMULATIVE"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn validate_policy_normalizes_resource_pools() {
+        let policy = build_policy();
+        let validated = validate_policy(&policy).expect("valid policy");
+        assert_eq!(validated.scheduler_mode, SchedulerMode::ListHeuristic);
+        assert_eq!(
+            validated.stage_auto_commit,
+            StageAutoCommitPolicy {
+                enabled: true,
+                quiescence_ms: 10,
+                max_open_ms: 20,
+                exclude_when_waiting: false,
+            }
+        );
+        assert_eq!(
+            validated.resource_pools,
+            vec![
+                ResourcePoolSpec {
+                    resource_id: "pool-1".to_string(),
+                    capacity: 1,
+                    kind: ResourcePoolKind::Cumulative,
+                    tags: vec![],
+                },
+                ResourcePoolSpec {
+                    resource_id: "pool-2".to_string(),
+                    capacity: 2,
+                    kind: ResourcePoolKind::Exclusive,
+                    tags: vec!["gpu".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_policy_rejects_duplicate_resource_ids() {
+        let mut policy = build_policy();
+        policy["resource_pools"] = json!([
+            { "resource_id": "pool-1", "capacity": 1, "kind": "CUMULATIVE" },
+            { "resource_id": "pool-1", "capacity": 2, "kind": "EXCLUSIVE" }
+        ]);
+        let result = validate_policy(&policy);
+        assert!(matches!(
+            result,
+            Err(PolicyError::DuplicateResourceId(id)) if id == "pool-1"
+        ));
+    }
+
+    #[test]
+    fn validate_policy_rejects_unsupported_scheduler_mode() {
+        let mut policy = build_policy();
+        policy["scheduler"]["mode"] = json!("OPTIMIZE_CP_SAT");
+        let result = validate_policy(&policy);
+        assert!(matches!(
+            result,
+            Err(PolicyError::UnsupportedSchedulerMode(mode)) if mode == "OPTIMIZE_CP_SAT"
+        ));
     }
 }
