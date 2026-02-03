@@ -207,15 +207,44 @@ fn parse_graph_patch_metadata(
             continue;
         }
         has_node_added = true;
-        let kind = op
+        let node = op
             .get("node_added")
             .and_then(|value| value.get("node"))
-            .and_then(|value| value.get("kind"))
+            .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                message: "node_added.node is missing".to_string(),
+            })?;
+        let kind = node
+            .get("kind")
             .and_then(|value| value.as_str())
             .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
                 message: "node_added.node.kind is missing".to_string(),
             })?;
         node_kinds.push(kind.to_string());
+        let exec = node
+            .get("exec")
+            .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                message: "node_added.node.exec is missing".to_string(),
+            })?;
+        if let Some(tool) = exec.get("tool") {
+            let side_effect = tool
+                .get("side_effect")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                    message: "tool.side_effect is missing".to_string(),
+                })?;
+            if side_effect != "NONE" {
+                let idempotency_key = tool
+                    .get("idempotency_key")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty());
+                if idempotency_key.is_none() {
+                    return Err(GraphPatchRejectionReason::InvalidPatch {
+                        message: "tool.idempotency_key is required when side_effect != NONE"
+                            .to_string(),
+                    });
+                }
+            }
+        }
     }
 
     Ok(GraphPatchMetadata {
@@ -474,6 +503,38 @@ mod tests {
         })
     }
 
+    fn node_added_tool_op(side_effect: &str, idempotency_key: Option<&str>) -> Value {
+        let mut tool_exec = json!({
+            "tool_name": "tool-a",
+            "tool_version": "v1",
+            "input": {
+                "literal": {
+                    "content_type": "application/json",
+                    "data_base64": "e30="
+                }
+            },
+            "side_effect": side_effect
+        });
+        if let Some(key) = idempotency_key {
+            tool_exec
+                .as_object_mut()
+                .expect("tool exec object")
+                .insert("idempotency_key".to_string(), json!(key));
+        }
+        json!({
+            "op_type": "NODE_ADDED",
+            "node_added": {
+                "node": {
+                    "node_id": "node-tool-1",
+                    "kind": "TOOL",
+                    "anchor_position": "WITHIN",
+                    "deps": [],
+                    "exec": { "tool": tool_exec }
+                }
+            }
+        })
+    }
+
     fn setup_service_with_run(
         active_stage_id: &str,
         allow_dynamic: bool,
@@ -652,5 +713,57 @@ mod tests {
             "unexpected rejection reason: {}",
             response.rejection_reason
         );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_side_effect_tool_without_idempotency_key() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["TOOL"], 0);
+        let patch = build_patch_document(
+            &handle.run_id,
+            0,
+            "stage-a",
+            json!([node_added_tool_op("EXTERNAL_WRITE", None)]),
+        );
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("idempotency_key"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_accepts_side_effect_none_without_idempotency_key() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["TOOL"], 0);
+        let patch = build_patch_document(
+            &handle.run_id,
+            0,
+            "stage-a",
+            json!([node_added_tool_op("NONE", None)]),
+        );
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(response.accepted);
+        assert!(response.rejection_reason.is_empty());
     }
 }
