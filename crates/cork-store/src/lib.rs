@@ -345,6 +345,28 @@ pub enum StateStoreError {
     MissingStageId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePayload {
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRef {
+    pub uri: String,
+    pub sha256_hex: String,
+    pub content_type: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeOutput {
+    pub payload: NodePayload,
+    pub is_json: bool,
+    pub parsed_json: Option<Value>,
+    pub artifacts: Vec<ArtifactRef>,
+}
+
 pub trait StateStore: Send + Sync {
     fn apply_state_put(
         &self,
@@ -356,6 +378,8 @@ pub trait StateStore: Send + Sync {
     ) -> Result<(), StateStoreError>;
     fn run_state(&self, run_id: &str) -> Option<Value>;
     fn stage_state(&self, run_id: &str, stage_id: &str) -> Option<Value>;
+    fn set_node_output(&self, run_id: &str, node_id: &str, output: NodeOutput);
+    fn node_output(&self, run_id: &str, node_id: &str) -> Option<NodeOutput>;
 }
 
 #[derive(Debug, Default)]
@@ -367,6 +391,7 @@ pub struct InMemoryStateStore {
 struct RunStateStore {
     run_state: Value,
     stage_state: HashMap<String, Value>,
+    node_outputs: HashMap<String, NodeOutput>,
 }
 
 impl InMemoryStateStore {
@@ -390,6 +415,7 @@ impl StateStore for InMemoryStateStore {
             .or_insert_with(|| RunStateStore {
                 run_state: Value::Object(serde_json::Map::new()),
                 stage_state: HashMap::new(),
+                node_outputs: HashMap::new(),
             });
         match scope {
             "RUN" => apply_pointer_mut(&mut state.run_state, json_pointer, value),
@@ -417,6 +443,25 @@ impl StateStore for InMemoryStateStore {
         states
             .get(run_id)
             .and_then(|state| state.stage_state.get(stage_id).cloned())
+    }
+
+    fn set_node_output(&self, run_id: &str, node_id: &str, output: NodeOutput) {
+        let mut states = self.states.write().expect("state store lock poisoned");
+        let state = states
+            .entry(run_id.to_string())
+            .or_insert_with(|| RunStateStore {
+                run_state: Value::Object(serde_json::Map::new()),
+                stage_state: HashMap::new(),
+                node_outputs: HashMap::new(),
+            });
+        state.node_outputs.insert(node_id.to_string(), output);
+    }
+
+    fn node_output(&self, run_id: &str, node_id: &str) -> Option<NodeOutput> {
+        let states = self.states.read().expect("state store lock poisoned");
+        states
+            .get(run_id)
+            .and_then(|state| state.node_outputs.get(node_id).cloned())
     }
 }
 
