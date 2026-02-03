@@ -850,6 +850,7 @@ CORE-034
 ### 進捗
 
 - [DONE] Stage auto-commit の判定ロジックとメタデータ更新を追加。
+- [DONE] GraphPatchがアクティブステージに触れた時のみ last_patch_at を更新するよう修正。
 - 変更ファイル: `crates/cork-core/src/engine/autocommit.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-store/src/lib.rs`, `crates/cork-core/src/engine/run.rs`。
 - 検証: `make fmt`, `make lint`, `make test`。
 

@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::patch::apply_graph_patch_ops;
+use crate::engine::run::node_stage_id;
 use cork_hash::sha256;
 use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
@@ -151,6 +152,11 @@ struct GraphPatchMetadata {
     has_node_added: bool,
 }
 
+#[derive(Debug)]
+struct StageTouch {
+    touches_active_stage: bool,
+}
+
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -273,6 +279,122 @@ fn parse_graph_patch_metadata(
         stage_id,
         node_kinds,
         has_node_added,
+    })
+}
+
+fn parse_stage_touch(
+    patch: &CanonicalJsonDocument,
+    active_stage_id: &str,
+) -> Result<StageTouch, GraphPatchRejectionReason> {
+    let value: Value = serde_json::from_slice(&patch.canonical_json_utf8).map_err(|err| {
+        GraphPatchRejectionReason::InvalidPatch {
+            message: err.to_string(),
+        }
+    })?;
+    let ops = value
+        .get("ops")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+            message: "ops is missing or not an array".to_string(),
+        })?;
+    for op in ops {
+        let op_type = op.get("op_type").and_then(|value| value.as_str());
+        match op_type {
+            Some("NODE_ADDED") => {
+                let node_id = op
+                    .get("node_added")
+                    .and_then(|value| value.get("node"))
+                    .and_then(|value| value.get("node_id"))
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                        message: "node_added.node.node_id is missing".to_string(),
+                    })?;
+                if node_stage_id(node_id) == Some(active_stage_id) {
+                    return Ok(StageTouch {
+                        touches_active_stage: true,
+                    });
+                }
+            }
+            Some("EDGE_ADDED") => {
+                let edge = op.get("edge_added").ok_or_else(|| {
+                    GraphPatchRejectionReason::InvalidPatch {
+                        message: "edge_added is missing".to_string(),
+                    }
+                })?;
+                let from = edge
+                    .get("from")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                        message: "edge_added.from is missing".to_string(),
+                    })?;
+                let to = edge
+                    .get("to")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                        message: "edge_added.to is missing".to_string(),
+                    })?;
+                if node_stage_id(from) == Some(active_stage_id)
+                    || node_stage_id(to) == Some(active_stage_id)
+                {
+                    return Ok(StageTouch {
+                        touches_active_stage: true,
+                    });
+                }
+            }
+            Some("STATE_PUT") => {
+                let state_put =
+                    op.get("state_put")
+                        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                            message: "state_put is missing".to_string(),
+                        })?;
+                let scope = state_put
+                    .get("scope")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                        message: "state_put.scope is missing".to_string(),
+                    })?;
+                if scope == "STAGE" {
+                    let stage_id = state_put
+                        .get("stage_id")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                            message: "state_put.stage_id is missing".to_string(),
+                        })?;
+                    if stage_id == active_stage_id {
+                        return Ok(StageTouch {
+                            touches_active_stage: true,
+                        });
+                    }
+                }
+            }
+            Some("NODE_UPDATED") => {
+                let node_id = op
+                    .get("node_updated")
+                    .and_then(|value| value.get("node_id"))
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                        message: "node_updated.node_id is missing".to_string(),
+                    })?;
+                if node_stage_id(node_id) == Some(active_stage_id) {
+                    return Ok(StageTouch {
+                        touches_active_stage: true,
+                    });
+                }
+            }
+            Some(other) => {
+                return Err(GraphPatchRejectionReason::InvalidPatch {
+                    message: format!("unsupported op_type {other}"),
+                });
+            }
+            None => {
+                return Err(GraphPatchRejectionReason::InvalidPatch {
+                    message: "op_type is missing".to_string(),
+                });
+            }
+        }
+    }
+    Ok(StageTouch {
+        touches_active_stage: false,
     })
 }
 
@@ -448,6 +570,10 @@ impl CorkCore for CorkCoreService {
                 },
             )));
         }
+        let stage_touch = match parse_stage_touch(&patch, &metadata.stage_id) {
+            Ok(stage_touch) => stage_touch,
+            Err(reason) => return Ok(Response::new(reject_response(reason))),
+        };
         if let Err(err) = apply_graph_patch_ops(
             run_ctx.run_id(),
             &patch,
@@ -461,7 +587,9 @@ impl CorkCore for CorkCoreService {
             )));
         }
         run_ctx.advance_patch_seq();
-        run_ctx.touch_stage_patch();
+        if stage_touch.touches_active_stage {
+            run_ctx.touch_stage_patch();
+        }
         let event = RunEvent {
             event_seq: 0,
             ts: Some(system_time_to_timestamp(SystemTime::now())),
@@ -502,6 +630,7 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
 
     fn build_sha256(bytes: &[u8]) -> Sha256 {
         Sha256 {
@@ -910,5 +1039,64 @@ mod tests {
             }
             _ => panic!("expected graph_patch event"),
         }
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_updates_stage_patch_only_when_active_stage_touched() {
+        let registry: Arc<dyn RunRegistry> = Arc::new(InMemoryRunRegistry::new());
+        let service = CorkCoreService::with_run_registry(Arc::clone(&registry));
+        let run = registry.create_run(CreateRunInput {
+            active_stage_id: Some("stage-a".to_string()),
+            active_stage_expansion_policy: Some(ExpansionPolicy {
+                allow_dynamic: true,
+                allow_kinds: vec!["LLM".to_string()],
+            }),
+            next_patch_seq: Some(0),
+            ..Default::default()
+        });
+        let old = SystemTime::now() - Duration::from_secs(30);
+        run.set_last_patch_at(Some(old));
+        let patch = build_patch_document(
+            run.run_id(),
+            0,
+            "stage-a",
+            json!([node_added_op_with_id("stage-b/node-1", "LLM")]),
+        );
+        let request = ApplyGraphPatchRequest {
+            handle: Some(RunHandle {
+                run_id: run.run_id().to_string(),
+            }),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(response.accepted);
+        assert_eq!(run.last_patch_at(), Some(old));
+
+        let patch = build_patch_document(
+            run.run_id(),
+            1,
+            "stage-a",
+            json!([node_added_op_with_id("stage-a/node-2", "LLM")]),
+        );
+        let request = ApplyGraphPatchRequest {
+            handle: Some(RunHandle {
+                run_id: run.run_id().to_string(),
+            }),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(response.accepted);
+        let updated = run.last_patch_at().expect("last_patch_at");
+        assert!(updated > old);
     }
 }
