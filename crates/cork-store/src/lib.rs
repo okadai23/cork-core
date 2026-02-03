@@ -6,13 +6,14 @@
 //!
 //! Run registry is implemented for CORE-010. Additional stores are TODO.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use cork_proto::cork::v1::{HashBundle, RunEvent, RunStatus};
+use serde_json::Value;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -100,6 +101,14 @@ impl RunCtx {
         Ok(metadata.next_patch_seq)
     }
 
+    pub fn check_patch_seq(&self, expected: u64) -> Result<(), u64> {
+        let metadata = self.metadata.read().expect("run metadata lock poisoned");
+        if metadata.next_patch_seq != expected {
+            return Err(metadata.next_patch_seq);
+        }
+        Ok(())
+    }
+
     pub fn advance_patch_seq(&self) -> u64 {
         let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
         metadata.next_patch_seq = metadata.next_patch_seq.saturating_add(1);
@@ -177,6 +186,323 @@ pub trait RunRegistry: Send + Sync {
     fn get_run(&self, run_id: &str) -> Option<Arc<RunCtx>>;
     fn list_runs(&self, page_token: Option<&str>, filters: RunFilters, page_size: usize)
     -> RunPage;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeSpec {
+    pub node_id: String,
+    pub kind: String,
+    pub anchor_position: String,
+    pub exec: Value,
+    pub deps: Vec<String>,
+    pub scheduling: Option<Value>,
+    pub htn: Option<Value>,
+    pub ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphStoreError {
+    NodeAlreadyExists(String),
+    NodeNotFound(String),
+    CycleDetected { from: String, to: String },
+}
+
+pub trait GraphStore: Send + Sync {
+    fn add_node(&self, run_id: &str, node: NodeSpec) -> Result<(), GraphStoreError>;
+    fn add_edge(&self, run_id: &str, from: &str, to: &str) -> Result<(), GraphStoreError>;
+    fn update_node(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        ttl_ms: Option<u64>,
+        scheduling: Option<Value>,
+        htn: Option<Value>,
+    ) -> Result<(), GraphStoreError>;
+    fn node(&self, run_id: &str, node_id: &str) -> Option<NodeSpec>;
+    fn deps(&self, run_id: &str, node_id: &str) -> Option<Vec<String>>;
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryGraphStore {
+    graphs: RwLock<HashMap<String, GraphState>>,
+}
+
+#[derive(Debug, Default)]
+struct GraphState {
+    nodes: HashMap<String, NodeSpec>,
+    edges: HashMap<String, Vec<String>>,
+}
+
+impl InMemoryGraphStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl GraphStore for InMemoryGraphStore {
+    fn add_node(&self, run_id: &str, node: NodeSpec) -> Result<(), GraphStoreError> {
+        let mut graphs = self.graphs.write().expect("graph store lock poisoned");
+        let graph = graphs.entry(run_id.to_string()).or_default();
+        if graph.nodes.contains_key(&node.node_id) {
+            return Err(GraphStoreError::NodeAlreadyExists(node.node_id));
+        }
+        let deps = node.deps.clone();
+        graph.edges.entry(node.node_id.clone()).or_insert(deps);
+        graph.nodes.insert(node.node_id.clone(), node);
+        Ok(())
+    }
+
+    fn add_edge(&self, run_id: &str, from: &str, to: &str) -> Result<(), GraphStoreError> {
+        let mut graphs = self.graphs.write().expect("graph store lock poisoned");
+        let graph = graphs.entry(run_id.to_string()).or_default();
+        if !graph.nodes.contains_key(from) {
+            return Err(GraphStoreError::NodeNotFound(from.to_string()));
+        }
+        if !graph.nodes.contains_key(to) {
+            return Err(GraphStoreError::NodeNotFound(to.to_string()));
+        }
+        if detects_cycle(&graph.edges, from, to) {
+            return Err(GraphStoreError::CycleDetected {
+                from: from.to_string(),
+                to: to.to_string(),
+            });
+        }
+        let deps = graph.edges.entry(to.to_string()).or_default();
+        if !deps.iter().any(|dep| dep == from) {
+            deps.push(from.to_string());
+        }
+        if let Some(node) = graph.nodes.get_mut(to) {
+            node.deps = deps.clone();
+        }
+        Ok(())
+    }
+
+    fn update_node(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        ttl_ms: Option<u64>,
+        scheduling: Option<Value>,
+        htn: Option<Value>,
+    ) -> Result<(), GraphStoreError> {
+        let mut graphs = self.graphs.write().expect("graph store lock poisoned");
+        let graph = graphs.entry(run_id.to_string()).or_default();
+        let Some(node) = graph.nodes.get_mut(node_id) else {
+            return Err(GraphStoreError::NodeNotFound(node_id.to_string()));
+        };
+        if let Some(ttl_ms) = ttl_ms {
+            node.ttl_ms = Some(ttl_ms);
+        }
+        if scheduling.is_some() {
+            node.scheduling = scheduling;
+        }
+        if htn.is_some() {
+            node.htn = htn;
+        }
+        Ok(())
+    }
+
+    fn node(&self, run_id: &str, node_id: &str) -> Option<NodeSpec> {
+        let graphs = self.graphs.read().expect("graph store lock poisoned");
+        graphs
+            .get(run_id)
+            .and_then(|graph| graph.nodes.get(node_id).cloned())
+    }
+
+    fn deps(&self, run_id: &str, node_id: &str) -> Option<Vec<String>> {
+        let graphs = self.graphs.read().expect("graph store lock poisoned");
+        graphs
+            .get(run_id)
+            .and_then(|graph| graph.edges.get(node_id).cloned())
+    }
+}
+
+fn detects_cycle(edges: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut stack = vec![from.to_string()];
+    let mut visited: HashSet<String> = HashSet::new();
+    while let Some(node) = stack.pop() {
+        if node == to {
+            return true;
+        }
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if let Some(deps) = edges.get(&node) {
+            for dep in deps {
+                stack.push(dep.clone());
+            }
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateStoreError {
+    InvalidJsonPointer(String),
+    MissingStageId,
+}
+
+pub trait StateStore: Send + Sync {
+    fn apply_state_put(
+        &self,
+        run_id: &str,
+        scope: &str,
+        stage_id: Option<&str>,
+        json_pointer: &str,
+        value: Value,
+    ) -> Result<(), StateStoreError>;
+    fn run_state(&self, run_id: &str) -> Option<Value>;
+    fn stage_state(&self, run_id: &str, stage_id: &str) -> Option<Value>;
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryStateStore {
+    states: RwLock<HashMap<String, RunStateStore>>,
+}
+
+#[derive(Debug, Default)]
+struct RunStateStore {
+    run_state: Value,
+    stage_state: HashMap<String, Value>,
+}
+
+impl InMemoryStateStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl StateStore for InMemoryStateStore {
+    fn apply_state_put(
+        &self,
+        run_id: &str,
+        scope: &str,
+        stage_id: Option<&str>,
+        json_pointer: &str,
+        value: Value,
+    ) -> Result<(), StateStoreError> {
+        let mut states = self.states.write().expect("state store lock poisoned");
+        let state = states
+            .entry(run_id.to_string())
+            .or_insert_with(|| RunStateStore {
+                run_state: Value::Object(serde_json::Map::new()),
+                stage_state: HashMap::new(),
+            });
+        match scope {
+            "RUN" => apply_pointer_mut(&mut state.run_state, json_pointer, value),
+            "STAGE" => {
+                let stage_id = stage_id.ok_or(StateStoreError::MissingStageId)?;
+                let entry = state
+                    .stage_state
+                    .entry(stage_id.to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                apply_pointer_mut(entry, json_pointer, value)
+            }
+            _ => Err(StateStoreError::InvalidJsonPointer(format!(
+                "unknown scope {scope}"
+            ))),
+        }
+    }
+
+    fn run_state(&self, run_id: &str) -> Option<Value> {
+        let states = self.states.read().expect("state store lock poisoned");
+        states.get(run_id).map(|state| state.run_state.clone())
+    }
+
+    fn stage_state(&self, run_id: &str, stage_id: &str) -> Option<Value> {
+        let states = self.states.read().expect("state store lock poisoned");
+        states
+            .get(run_id)
+            .and_then(|state| state.stage_state.get(stage_id).cloned())
+    }
+}
+
+fn apply_pointer_mut(
+    root: &mut Value,
+    json_pointer: &str,
+    value: Value,
+) -> Result<(), StateStoreError> {
+    if json_pointer.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+    ensure_pointer_path(root, json_pointer)?;
+    let Some(target) = root.pointer_mut(json_pointer) else {
+        return Err(StateStoreError::InvalidJsonPointer(
+            json_pointer.to_string(),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
+fn ensure_pointer_path(root: &mut Value, json_pointer: &str) -> Result<(), StateStoreError> {
+    if !json_pointer.starts_with('/') {
+        return Err(StateStoreError::InvalidJsonPointer(
+            json_pointer.to_string(),
+        ));
+    }
+    let tokens: Vec<String> = json_pointer
+        .split('/')
+        .skip(1)
+        .map(unescape_pointer_token)
+        .collect();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    ensure_pointer_path_recursive(root, json_pointer, &tokens)
+}
+
+fn unescape_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+fn ensure_pointer_path_recursive(
+    current: &mut Value,
+    json_pointer: &str,
+    tokens: &[String],
+) -> Result<(), StateStoreError> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let token = &tokens[0];
+    let is_last = tokens.len() == 1;
+    match current {
+        Value::Object(map) => {
+            if is_last {
+                map.entry(token.to_string()).or_insert(Value::Null);
+                Ok(())
+            } else {
+                let entry = map
+                    .entry(token.to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                ensure_pointer_path_recursive(entry, json_pointer, &tokens[1..])
+            }
+        }
+        Value::Array(items) => {
+            let idx = token
+                .parse::<usize>()
+                .map_err(|_| StateStoreError::InvalidJsonPointer(json_pointer.to_string()))?;
+            if idx >= items.len() {
+                items.resize(idx + 1, Value::Null);
+            }
+            if is_last {
+                if items[idx].is_null() {
+                    items[idx] = Value::Null;
+                }
+                Ok(())
+            } else {
+                ensure_pointer_path_recursive(&mut items[idx], json_pointer, &tokens[1..])
+            }
+        }
+        _ => {
+            *current = Value::Object(serde_json::Map::new());
+            ensure_pointer_path_recursive(current, json_pointer, tokens)
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -536,5 +862,100 @@ mod tests {
 
         let empty = log.subscribe(2);
         assert!(empty.backlog.is_empty());
+    }
+
+    #[test]
+    fn graph_store_adds_nodes_and_edges() {
+        let store = InMemoryGraphStore::new();
+        let run_id = "run-1";
+        let node_a = NodeSpec {
+            node_id: "node-a".to_string(),
+            kind: "TOOL".to_string(),
+            anchor_position: "WITHIN".to_string(),
+            exec: Value::Null,
+            deps: Vec::new(),
+            scheduling: None,
+            htn: None,
+            ttl_ms: None,
+        };
+        let node_b = NodeSpec {
+            node_id: "node-b".to_string(),
+            kind: "LLM".to_string(),
+            anchor_position: "WITHIN".to_string(),
+            exec: Value::Null,
+            deps: vec!["node-a".to_string()],
+            scheduling: None,
+            htn: None,
+            ttl_ms: None,
+        };
+
+        store.add_node(run_id, node_a).expect("add node a");
+        store.add_node(run_id, node_b).expect("add node b");
+        store
+            .add_edge(run_id, "node-a", "node-b")
+            .expect("add edge");
+
+        let deps = store.deps(run_id, "node-b").expect("deps");
+        assert_eq!(deps, vec!["node-a".to_string()]);
+    }
+
+    #[test]
+    fn graph_store_rejects_cycles() {
+        let store = InMemoryGraphStore::new();
+        let run_id = "run-2";
+        let node_a = NodeSpec {
+            node_id: "node-a".to_string(),
+            kind: "TOOL".to_string(),
+            anchor_position: "WITHIN".to_string(),
+            exec: Value::Null,
+            deps: Vec::new(),
+            scheduling: None,
+            htn: None,
+            ttl_ms: None,
+        };
+        let node_b = NodeSpec {
+            node_id: "node-b".to_string(),
+            kind: "LLM".to_string(),
+            anchor_position: "WITHIN".to_string(),
+            exec: Value::Null,
+            deps: Vec::new(),
+            scheduling: None,
+            htn: None,
+            ttl_ms: None,
+        };
+
+        store.add_node(run_id, node_a).expect("add node a");
+        store.add_node(run_id, node_b).expect("add node b");
+        store
+            .add_edge(run_id, "node-a", "node-b")
+            .expect("add edge a->b");
+        let result = store.add_edge(run_id, "node-b", "node-a");
+        assert!(matches!(result, Err(GraphStoreError::CycleDetected { .. })));
+    }
+
+    #[test]
+    fn state_store_applies_json_pointer() {
+        let store = InMemoryStateStore::new();
+        let run_id = "run-3";
+        store
+            .apply_state_put(run_id, "RUN", None, "/foo/bar", serde_json::json!(42))
+            .expect("apply run state");
+        let run_state = store.run_state(run_id).expect("run state");
+        assert_eq!(run_state.pointer("/foo/bar"), Some(&serde_json::json!(42)));
+
+        store
+            .apply_state_put(
+                run_id,
+                "STAGE",
+                Some("stage-1"),
+                "/meta",
+                serde_json::json!({"ok": true}),
+            )
+            .expect("apply stage state");
+        let stage_state = store.stage_state(run_id, "stage-1").expect("stage state");
+        assert_eq!(
+            stage_state.pointer("/meta/ok"),
+            Some(&serde_json::json!(true))
+        );
     }
 }

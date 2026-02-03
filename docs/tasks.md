@@ -531,16 +531,16 @@ CORE-024
 
 ### サブタスク
 
-- [ ] GraphStore（inmem）:
+- [x] GraphStore（inmem）:
   - nodes: HashMap<NodeId, NodeSpec>
   - edges: adjacency（deps）
-- [ ] NODE_ADDED:
+- [x] NODE_ADDED:
   - NodeSpec格納（kind/exec/deps/scheduling/htn/ttl）
-- [ ] EDGE_ADDED:
+- [x] EDGE_ADDED:
   - deps追加（循環を "MVPは拒否" 推奨：stage内cycle検出）
-- [ ] STATE_PUT:
+- [x] STATE_PUT:
   - RunState/StageState JSON に pointer_mut で反映
-- [ ] NODE_UPDATED:
+- [x] NODE_UPDATED:
   - ttl/scheduling/htn を上書き
 
 ### DoD
@@ -549,10 +549,16 @@ CORE-024
 
 ### Acceptance Criteria
 
-- [ ] NODE_ADDED後、内部graphに node_id が出現する
-- [ ] EDGE_ADDED後、依存が追加される
-- [ ] STATE_PUTで RunState JSON が更新され、以後参照できる
-- [ ] すべての操作が RunEvent(graph_patch) として event_log に残る
+- [x] NODE_ADDED後、内部graphに node_id が出現する
+- [x] EDGE_ADDED後、依存が追加される
+- [x] STATE_PUTで RunState JSON が更新され、以後参照できる
+- [x] すべての操作が RunEvent(graph_patch) として event_log に残る
+
+### 進捗
+
+- [DONE] GraphStore/StateStore と GraphPatch ops 適用を実装。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/engine/patch.rs`, `crates/cork-core/src/api/core_service.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 

@@ -5,8 +5,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::engine::patch::apply_graph_patch_ops;
 use cork_hash::sha256;
+use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
     ApplyGraphPatchRequest, ApplyGraphPatchResponse, CancelRunRequest, CancelRunResponse,
     CanonicalJsonDocument, GetCompositeGraphRequest, GetCompositeGraphResponse, GetLogsRequest,
@@ -14,8 +17,10 @@ use cork_proto::cork::v1::{
     StreamRunEventsRequest, SubmitRunRequest, SubmitRunResponse, cork_core_server::CorkCore,
 };
 use cork_store::{
-    CreateRunInput, EventLog, InMemoryEventLog, InMemoryRunRegistry, RunCtx, RunRegistry,
+    CreateRunInput, EventLog, InMemoryEventLog, InMemoryGraphStore, InMemoryRunRegistry,
+    InMemoryStateStore, RunCtx, RunRegistry,
 };
+use prost_types::Timestamp;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -26,7 +31,9 @@ use tonic::{Request, Response, Status};
 /// The CorkCore service implementation.
 pub struct CorkCoreService {
     event_logs: Arc<RwLock<HashMap<String, Arc<InMemoryEventLog>>>>,
+    graph_store: Arc<InMemoryGraphStore>,
     run_registry: Arc<dyn RunRegistry>,
+    state_store: Arc<InMemoryStateStore>,
 }
 
 impl CorkCoreService {
@@ -38,7 +45,9 @@ impl CorkCoreService {
     pub fn with_run_registry(run_registry: Arc<dyn RunRegistry>) -> Self {
         Self {
             event_logs: Arc::new(RwLock::new(HashMap::new())),
+            graph_store: Arc::new(InMemoryGraphStore::new()),
             run_registry,
+            state_store: Arc::new(InMemoryStateStore::new()),
         }
     }
 
@@ -61,7 +70,9 @@ impl Default for CorkCoreService {
     fn default() -> Self {
         Self {
             event_logs: Arc::new(RwLock::new(HashMap::new())),
+            graph_store: Arc::new(InMemoryGraphStore::new()),
             run_registry: Arc::new(InMemoryRunRegistry::new()),
+            state_store: Arc::new(InMemoryStateStore::new()),
         }
     }
 }
@@ -146,6 +157,16 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{:02x}", byte));
     }
     out
+}
+
+fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
+    let duration = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+    Timestamp {
+        seconds: duration.as_secs() as i64,
+        nanos: duration.subsec_nanos() as i32,
+    }
 }
 
 fn verify_canonical_sha256(doc: &CanonicalJsonDocument) -> Result<Sha256Verification, Box<Status>> {
@@ -419,7 +440,7 @@ impl CorkCore for CorkCoreService {
                 }
             }
         }
-        if let Err(expected) = run_ctx.try_advance_patch_seq(metadata.patch_seq) {
+        if let Err(expected) = run_ctx.check_patch_seq(metadata.patch_seq) {
             return Ok(Response::new(reject_response(
                 GraphPatchRejectionReason::PatchSeqMismatch {
                     expected,
@@ -427,6 +448,25 @@ impl CorkCore for CorkCoreService {
                 },
             )));
         }
+        if let Err(err) = apply_graph_patch_ops(
+            run_ctx.run_id(),
+            &patch,
+            self.graph_store.as_ref(),
+            self.state_store.as_ref(),
+        ) {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::InvalidPatch {
+                    message: err.message(),
+                },
+            )));
+        }
+        run_ctx.advance_patch_seq();
+        let event = RunEvent {
+            event_seq: 0,
+            ts: Some(system_time_to_timestamp(SystemTime::now())),
+            event: Some(run_event::Event::GraphPatch(patch.clone())),
+        };
+        self.event_log_for_run(run_ctx.run_id()).append(event);
         Ok(Response::new(ApplyGraphPatchResponse {
             accepted: true,
             rejection_reason: String::new(),
@@ -456,7 +496,9 @@ mod tests {
     use cork_proto::cork::v1::{
         ApplyGraphPatchRequest, CanonicalJsonDocument, RunHandle, Sha256, StreamRunEventsRequest,
     };
-    use cork_store::{CreateRunInput, ExpansionPolicy, InMemoryRunRegistry, RunRegistry};
+    use cork_store::{
+        CreateRunInput, ExpansionPolicy, GraphStore, InMemoryRunRegistry, RunRegistry, StateStore,
+    };
     use serde_json::{Value, json};
     use std::sync::Arc;
 
@@ -489,17 +531,58 @@ mod tests {
     }
 
     fn node_added_op(kind: &str) -> Value {
+        node_added_op_with_id("node-1", kind)
+    }
+
+    fn node_added_op_with_id(node_id: &str, kind: &str) -> Value {
         json!({
             "op_type": "NODE_ADDED",
             "node_added": {
                 "node": {
-                    "node_id": "node-1",
+                    "node_id": node_id,
                     "kind": kind,
                     "anchor_position": "WITHIN",
                     "deps": [],
                     "exec": { "llm": { "provider": "test", "model": "test", "messages": [ { "role": "user", "parts": [ { "text": "hi" } ] } ] } }
                 }
             }
+        })
+    }
+
+    fn edge_added_op(from: &str, to: &str) -> Value {
+        json!({
+            "op_type": "EDGE_ADDED",
+            "edge_added": { "from": from, "to": to }
+        })
+    }
+
+    fn state_put_op(
+        scope: &str,
+        stage_id: Option<&str>,
+        json_pointer: &str,
+        value: Value,
+    ) -> Value {
+        let mut state_put = json!({
+            "scope": scope,
+            "json_pointer": json_pointer,
+            "value": value
+        });
+        if let Some(stage_id) = stage_id {
+            state_put
+                .as_object_mut()
+                .expect("state_put object")
+                .insert("stage_id".to_string(), json!(stage_id));
+        }
+        json!({
+            "op_type": "STATE_PUT",
+            "state_put": state_put
+        })
+    }
+
+    fn node_updated_op(node_id: &str, patch: Value) -> Value {
+        json!({
+            "op_type": "NODE_UPDATED",
+            "node_updated": { "node_id": node_id, "patch": patch }
         })
     }
 
@@ -639,7 +722,9 @@ mod tests {
             .await
             .expect("apply response")
             .into_inner();
-        assert!(response.accepted);
+        if !response.accepted {
+            panic!("rejection: {}", response.rejection_reason);
+        }
         assert!(response.rejection_reason.is_empty());
     }
 
@@ -763,7 +848,66 @@ mod tests {
             .await
             .expect("apply response")
             .into_inner();
-        assert!(response.accepted);
+        assert!(
+            response.accepted,
+            "rejection: {}",
+            response.rejection_reason
+        );
         assert!(response.rejection_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_updates_graph_state_and_logs_event() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let ops = json!([
+            node_added_op_with_id("node-a", "LLM"),
+            node_added_op_with_id("node-b", "LLM"),
+            edge_added_op("node-a", "node-b"),
+            state_put_op("RUN", None, "/state/value", json!({"ok": true})),
+            node_updated_op("node-b", json!({"ttl_ms": 1234}))
+        ]);
+        let patch = build_patch_document(&handle.run_id, 0, "stage-a", ops);
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle.clone()),
+            patch: Some(patch.clone()),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        if !response.accepted {
+            panic!("rejection: {}", response.rejection_reason);
+        }
+
+        let node_b = service
+            .graph_store
+            .node(&handle.run_id, "node-b")
+            .expect("node-b");
+        assert_eq!(node_b.ttl_ms, Some(1234));
+        let deps = service
+            .graph_store
+            .deps(&handle.run_id, "node-b")
+            .expect("deps");
+        assert_eq!(deps, vec!["node-a".to_string()]);
+
+        let run_state = service
+            .state_store
+            .run_state(&handle.run_id)
+            .expect("run state");
+        assert_eq!(run_state.pointer("/state/value/ok"), Some(&json!(true)));
+
+        let log = service.event_log_for_run(&handle.run_id);
+        let subscription = log.subscribe(0);
+        assert_eq!(subscription.backlog.len(), 1);
+        let event = &subscription.backlog[0];
+        match event.event.as_ref() {
+            Some(run_event::Event::GraphPatch(doc)) => {
+                assert_eq!(doc.schema_id, patch.schema_id);
+            }
+            _ => panic!("expected graph_patch event"),
+        }
     }
 }
