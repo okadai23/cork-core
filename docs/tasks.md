@@ -876,15 +876,15 @@ CORE-034
 
 ### サブタスク
 
-- [ ] tonic client生成（`CorkWorkerClient<Channel>`）
-- [ ] deadline算出:
+- [x] tonic client生成（`CorkWorkerClient<Channel>`）
+- [x] deadline算出:
   - run/stage/node budgetから残り時間を計算
   - `Request::set_timeout(Duration)` を設定
-- [ ] InvokeTool:
+- [x] InvokeTool:
   - unaryで結果受領
-- [ ] InvokeToolStream:
+- [x] InvokeToolStream:
   - heartbeat/log chunk を逐次RunEvent(log)に変換してappend
-- [ ] エラー処理:
+- [x] エラー処理:
   - tonic Status を Node FAILED reason に反映
 
 ### DoD
@@ -893,9 +893,17 @@ CORE-034
 
 ### Acceptance Criteria
 
-- [ ] Workerが応答すれば Node が SUCCEEDED になる
-- [ ] Workerがエラーなら Node が FAILED になり reason が残る
-- [ ] deadline超過を模擬でき、deadline_exceeded相当の挙動になる
+- [x] Workerが応答すれば Node が SUCCEEDED になる
+- [x] Workerがエラーなら Node が FAILED になり reason が残る
+- [x] deadline超過を模擬でき、deadline_exceeded相当の挙動になる
+
+### 進捗
+
+- [DONE] CorkWorker クライアントと InvokeTool / InvokeToolStream の結果処理を追加。
+- [DONE] deadline算出と gRPC timeout 設定、ログ/失敗イベントの反映を実装。
+- [DONE] caller指定deadlineとbudgetを比較して早い方を採用するよう修正。
+- 変更ファイル: `crates/cork-core/src/worker/client.rs`, `crates/cork-core/src/worker/mod.rs`, `crates/cork-core/src/lib.rs`。
+- 検証: `make fmt`, `make lint`, `make test`。
 
 ---
 
