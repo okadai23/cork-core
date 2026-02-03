@@ -491,9 +491,9 @@ CORE-024
 
 ### サブタスク
 
-- [ ] NODE_ADDEDの中の ToolExec を走査
-- [ ] side_effect != NONE なら idempotency_key必須
-- [ ] 無い場合 patch全体を拒否（部分適用は禁止）
+- [x] NODE_ADDEDの中の ToolExec を走査
+- [x] side_effect != NONE なら idempotency_key必須
+- [x] 無い場合 patch全体を拒否（部分適用は禁止）
 
 ### DoD
 
@@ -501,8 +501,14 @@ CORE-024
 
 ### Acceptance Criteria
 
-- [ ] side_effect=EXTERNAL_WRITE で idempotency_key無し → 100%拒否
-- [ ] side_effect=NONE で idempotency_key無し → 受理
+- [x] side_effect=EXTERNAL_WRITE で idempotency_key無し → 100%拒否
+- [x] side_effect=NONE で idempotency_key無し → 受理
+
+### 進捗
+
+- [DONE] NODE_ADDED の ToolExec を検査し、side_effect != NONE の idempotency_key 欠如を拒否。
+  - 変更ファイル: `crates/cork-core/src/api/core_service.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 ---
 
