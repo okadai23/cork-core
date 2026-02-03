@@ -362,9 +362,33 @@ pub struct ArtifactRef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeOutput {
     pub payload: NodePayload,
-    pub is_json: bool,
     pub parsed_json: Option<Value>,
     pub artifacts: Vec<ArtifactRef>,
+}
+
+impl NodeOutput {
+    pub fn from_payload(payload: NodePayload, artifacts: Vec<ArtifactRef>) -> Self {
+        let parsed_json = if is_json_content_type(&payload.content_type) {
+            serde_json::from_slice(&payload.data).ok()
+        } else {
+            None
+        };
+        Self {
+            payload,
+            parsed_json,
+            artifacts,
+        }
+    }
+
+    pub fn is_json(&self) -> bool {
+        is_json_content_type(&self.payload.content_type)
+    }
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    let content_type = content_type.split(';').next().unwrap_or("").trim();
+    let content_type = content_type.to_ascii_lowercase();
+    content_type == "application/json" || content_type.ends_with("+json")
 }
 
 pub trait StateStore: Send + Sync {
@@ -1002,5 +1026,28 @@ mod tests {
             stage_state.pointer("/meta/ok"),
             Some(&serde_json::json!(true))
         );
+    }
+
+    #[test]
+    fn node_output_parses_json_payloads() {
+        let output = NodeOutput::from_payload(
+            NodePayload {
+                content_type: "application/json; charset=utf-8".to_string(),
+                data: br#"{"ok": true}"#.to_vec(),
+            },
+            Vec::new(),
+        );
+        assert!(output.is_json());
+        assert_eq!(output.parsed_json, Some(serde_json::json!({ "ok": true })));
+
+        let text_output = NodeOutput::from_payload(
+            NodePayload {
+                content_type: "text/plain".to_string(),
+                data: b"hello".to_vec(),
+            },
+            Vec::new(),
+        );
+        assert!(!text_output.is_json());
+        assert_eq!(text_output.parsed_json, None);
     }
 }

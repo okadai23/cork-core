@@ -77,7 +77,7 @@ fn resolve_node_output(
     let output = store
         .node_output(&value_ref.run_id, node_id)
         .ok_or_else(|| ValueRefError::NotFound(format!("node_output {node_id}")))?;
-    if output.is_json {
+    if output.is_json() {
         let json = output
             .parsed_json
             .as_ref()
@@ -209,15 +209,13 @@ mod tests {
     #[test]
     fn resolves_node_output_json_pointer() {
         let store = InMemoryStateStore::new();
-        let output = NodeOutput {
-            payload: NodePayload {
+        let output = NodeOutput::from_payload(
+            NodePayload {
                 content_type: "application/json".to_string(),
                 data: br#"{"value": {"nested": "ok"}}"#.to_vec(),
             },
-            is_json: true,
-            parsed_json: Some(json!({"value": {"nested": "ok"}})),
-            artifacts: Vec::new(),
-        };
+            Vec::new(),
+        );
         store.set_node_output("run-1", "node-1", output);
 
         let value_ref = ValueRef {
@@ -236,15 +234,13 @@ mod tests {
     #[test]
     fn rejects_non_json_output_with_pointer() {
         let store = InMemoryStateStore::new();
-        let output = NodeOutput {
-            payload: NodePayload {
+        let output = NodeOutput::from_payload(
+            NodePayload {
                 content_type: "text/plain".to_string(),
                 data: b"hello".to_vec(),
             },
-            is_json: false,
-            parsed_json: None,
-            artifacts: Vec::new(),
-        };
+            Vec::new(),
+        );
         store.set_node_output("run-1", "node-1", output);
 
         let value_ref = ValueRef {
@@ -263,15 +259,13 @@ mod tests {
     #[test]
     fn resolves_node_output_text_without_pointer() {
         let store = InMemoryStateStore::new();
-        let output = NodeOutput {
-            payload: NodePayload {
+        let output = NodeOutput::from_payload(
+            NodePayload {
                 content_type: "text/plain".to_string(),
                 data: b"hello".to_vec(),
             },
-            is_json: false,
-            parsed_json: None,
-            artifacts: Vec::new(),
-        };
+            Vec::new(),
+        );
         store.set_node_output("run-1", "node-1", output);
 
         let value_ref = ValueRef {
@@ -290,20 +284,18 @@ mod tests {
     #[test]
     fn resolves_node_artifact() {
         let store = InMemoryStateStore::new();
-        let output = NodeOutput {
-            payload: NodePayload {
+        let output = NodeOutput::from_payload(
+            NodePayload {
                 content_type: "application/json".to_string(),
                 data: br#"{}"#.to_vec(),
             },
-            is_json: true,
-            parsed_json: Some(json!({})),
-            artifacts: vec![ArtifactRef {
+            vec![ArtifactRef {
                 uri: "file://artifact.txt".to_string(),
                 sha256_hex: "abc123".to_string(),
                 content_type: Some("text/plain".to_string()),
                 size_bytes: Some(5),
             }],
-        };
+        );
         store.set_node_output("run-1", "node-1", output);
 
         let value_ref = ValueRef {
