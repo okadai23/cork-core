@@ -4,10 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cork_proto::cork::v1::{GetRunResponse, RunHandle, RunStatus};
 use cork_store::{
-    ArtifactRef, NodeOutput, NodePayload, RunCtx, RunRegistry, StageAutoCommitPolicy, StateStore,
+    ArtifactRef, NodeOutput, NodePayload, NodeSpec, RunCtx, RunRegistry, StageAutoCommitPolicy,
+    StateStore,
 };
 use prost_types::Timestamp;
 use serde_json::Value;
+
+use super::refs::{RenderAs, ValueRef, ValueRefType, resolve_value_ref};
 
 pub fn run_ctx_to_response(run_ctx: &Arc<RunCtx>) -> GetRunResponse {
     let metadata = run_ctx.metadata();
@@ -122,6 +125,247 @@ pub fn validate_policy(value: &Value) -> Result<ValidatedPolicy, PolicyError> {
         scheduler_mode,
         stage_auto_commit,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeRuntimeStatus {
+    Pending,
+    Ready,
+    Running,
+    Succeeded,
+    Failed,
+    Skipped,
+    Cancelled,
+    TimedOut,
+    Expired,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRuntimeState {
+    pub status: NodeRuntimeStatus,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageRuntimeStatus {
+    Pending,
+    Active,
+    Committed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageRuntimeState {
+    pub status: StageRuntimeStatus,
+}
+
+pub fn evaluate_node_readiness(
+    run_id: &str,
+    node: &NodeSpec,
+    current_state: &NodeRuntimeState,
+    node_states: &HashMap<String, NodeRuntimeState>,
+    stage_states: &HashMap<String, StageRuntimeState>,
+    contract: &ValidatedContractManifest,
+    state_store: &dyn StateStore,
+) -> NodeRuntimeState {
+    if current_state.status != NodeRuntimeStatus::Pending {
+        return current_state.clone();
+    }
+
+    if let Err(err) = deps_ready(node, node_states) {
+        return NodeRuntimeState {
+            status: NodeRuntimeStatus::Pending,
+            last_error: Some(err),
+        };
+    }
+
+    if let Err(err) = stage_order_ready(node, stage_states, contract) {
+        return NodeRuntimeState {
+            status: NodeRuntimeStatus::Pending,
+            last_error: Some(err),
+        };
+    }
+
+    if let Err(err) = refs_ready(run_id, node, state_store) {
+        return NodeRuntimeState {
+            status: NodeRuntimeStatus::Pending,
+            last_error: Some(err),
+        };
+    }
+
+    NodeRuntimeState {
+        status: NodeRuntimeStatus::Ready,
+        last_error: None,
+    }
+}
+
+fn deps_ready(
+    node: &NodeSpec,
+    node_states: &HashMap<String, NodeRuntimeState>,
+) -> Result<(), String> {
+    for dep in &node.deps {
+        let Some(state) = node_states.get(dep) else {
+            return Err(format!("dependency {dep} is missing state"));
+        };
+        if state.status != NodeRuntimeStatus::Succeeded {
+            return Err(format!("dependency {dep} is not succeeded"));
+        }
+    }
+    Ok(())
+}
+
+fn stage_order_ready(
+    node: &NodeSpec,
+    stage_states: &HashMap<String, StageRuntimeState>,
+    contract: &ValidatedContractManifest,
+) -> Result<(), String> {
+    let stage_id =
+        node_stage_id(&node.node_id).ok_or_else(|| "node stage_id is missing".to_string())?;
+    let Some(position) = contract
+        .stage_order
+        .iter()
+        .position(|stage| stage == stage_id)
+    else {
+        return Err(format!("stage {stage_id} is not in contract order"));
+    };
+    for upstream in &contract.stage_order[..position] {
+        let Some(stage_state) = stage_states.get(upstream) else {
+            return Err(format!("upstream stage {upstream} state is missing"));
+        };
+        if stage_state.status != StageRuntimeStatus::Committed {
+            return Err(format!("upstream stage {upstream} is not committed"));
+        }
+    }
+    Ok(())
+}
+
+fn refs_ready(run_id: &str, node: &NodeSpec, state_store: &dyn StateStore) -> Result<(), String> {
+    let refs = collect_exec_value_refs(run_id, &node.exec)?;
+    for value_ref in refs {
+        resolve_value_ref(&value_ref, state_store)
+            .map_err(|err| format!("ref {:?} resolution failed: {err:?}", value_ref.ref_type))?;
+    }
+    Ok(())
+}
+
+fn collect_exec_value_refs(run_id: &str, exec: &Value) -> Result<Vec<ValueRef>, String> {
+    let mut refs = Vec::new();
+    if let Some(tool_exec) = exec.get("tool")
+        && let Some(input) = tool_exec.get("input")
+    {
+        collect_input_spec_refs(run_id, input, &mut refs)?;
+    }
+    if let Some(llm_exec) = exec.get("llm") {
+        let messages = llm_exec
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| "llm.messages is missing".to_string())?;
+        for message in messages {
+            let parts = message
+                .get("parts")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| "llm.message.parts is missing".to_string())?;
+            for part in parts {
+                if let Some(value_ref) = part.get("ref") {
+                    refs.push(parse_value_ref(run_id, value_ref)?);
+                }
+            }
+        }
+    }
+    Ok(refs)
+}
+
+fn collect_input_spec_refs(
+    run_id: &str,
+    input_spec: &Value,
+    refs: &mut Vec<ValueRef>,
+) -> Result<(), String> {
+    let Some(obj) = input_spec.as_object() else {
+        return Err("input spec must be object".to_string());
+    };
+    if let Some(value_ref) = obj.get("ref") {
+        refs.push(parse_value_ref(run_id, value_ref)?);
+    }
+    Ok(())
+}
+
+fn parse_value_ref(run_id: &str, value: &Value) -> Result<ValueRef, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("ref must be object".to_string());
+    };
+    let ref_type = obj
+        .get("ref_type")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "ref_type is missing".to_string())?;
+    let ref_type = match ref_type {
+        "RUN_STATE" => ValueRefType::RunState,
+        "STAGE_STATE" => ValueRefType::StageState,
+        "NODE_OUTPUT" => ValueRefType::NodeOutput,
+        "NODE_ARTIFACT" => ValueRefType::NodeArtifact,
+        other => return Err(format!("unknown ref_type {other}")),
+    };
+    let json_pointer = obj
+        .get("json_pointer")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let stage_id = obj
+        .get("stage_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let node_id = obj
+        .get("node_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let artifact_index = obj
+        .get("artifact_index")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let render_as = obj
+        .get("render_as")
+        .and_then(|value| value.as_str())
+        .map(|value| match value {
+            "JSON_COMPACT" => Ok(RenderAs::JsonCompact),
+            "JSON_PRETTY" => Ok(RenderAs::JsonPretty),
+            "TEXT" => Ok(RenderAs::Text),
+            other => Err(format!("unknown render_as {other}")),
+        })
+        .transpose()?;
+
+    let json_pointer = match ref_type {
+        ValueRefType::RunState | ValueRefType::StageState | ValueRefType::NodeOutput => {
+            json_pointer.ok_or_else(|| "json_pointer is required".to_string())?
+        }
+        ValueRefType::NodeArtifact => json_pointer.unwrap_or_default(),
+    };
+    if matches!(ref_type, ValueRefType::StageState) && stage_id.is_none() {
+        return Err("stage_id is required".to_string());
+    }
+    if matches!(
+        ref_type,
+        ValueRefType::NodeOutput | ValueRefType::NodeArtifact
+    ) && node_id.is_none()
+    {
+        return Err("node_id is required".to_string());
+    }
+    if matches!(ref_type, ValueRefType::NodeArtifact) && artifact_index.is_none() {
+        return Err("artifact_index is required".to_string());
+    }
+
+    Ok(ValueRef {
+        run_id: run_id.to_string(),
+        ref_type,
+        json_pointer,
+        stage_id,
+        node_id,
+        artifact_index,
+        render_as,
+    })
+}
+
+fn node_stage_id(node_id: &str) -> Option<&str> {
+    let mut parts = node_id.split('/');
+    parts.next().filter(|value| !value.is_empty())
 }
 
 fn validate_contract_graph(value: &Value) -> Result<Vec<String>, ContractManifestError> {
@@ -441,6 +685,212 @@ mod tests {
             page.runs[0].metadata().experiment_id.as_deref(),
             Some("exp-1")
         );
+    }
+
+    fn node_spec(node_id: &str, deps: Vec<&str>, exec: Value) -> NodeSpec {
+        NodeSpec {
+            node_id: node_id.to_string(),
+            kind: "tool".to_string(),
+            anchor_position: "WITHIN".to_string(),
+            exec,
+            deps: deps.into_iter().map(str::to_string).collect(),
+            scheduling: None,
+            htn: None,
+            ttl_ms: None,
+        }
+    }
+
+    fn tool_exec_with_ref(ref_value: Value) -> Value {
+        json!({
+            "tool": {
+                "tool_name": "tool-a",
+                "tool_version": "v1",
+                "side_effect": "NONE",
+                "input": { "ref": ref_value }
+            }
+        })
+    }
+
+    fn run_state_ref_value(pointer: &str) -> Value {
+        json!({
+            "ref_type": "RUN_STATE",
+            "json_pointer": pointer
+        })
+    }
+
+    fn pending_state() -> NodeRuntimeState {
+        NodeRuntimeState {
+            status: NodeRuntimeStatus::Pending,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn evaluate_node_readiness_blocks_on_unsatisfied_deps() {
+        let node = node_spec(
+            "stage-a/node-b",
+            vec!["stage-a/node-a"],
+            tool_exec_with_ref(run_state_ref_value("/input")),
+        );
+        let mut node_states = HashMap::new();
+        node_states.insert(
+            "stage-a/node-a".to_string(),
+            NodeRuntimeState {
+                status: NodeRuntimeStatus::Pending,
+                last_error: None,
+            },
+        );
+        let stage_states = HashMap::from([(
+            "stage-a".to_string(),
+            StageRuntimeState {
+                status: StageRuntimeStatus::Committed,
+            },
+        )]);
+        let contract = ValidatedContractManifest {
+            stage_order: vec!["stage-a".to_string()],
+        };
+        let store = InMemoryStateStore::new();
+
+        let next = evaluate_node_readiness(
+            "run-1",
+            &node,
+            &pending_state(),
+            &node_states,
+            &stage_states,
+            &contract,
+            &store,
+        );
+        assert_eq!(next.status, NodeRuntimeStatus::Pending);
+        assert!(
+            next.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dependency")
+        );
+    }
+
+    #[test]
+    fn evaluate_node_readiness_blocks_on_unresolved_refs() {
+        let node = node_spec(
+            "stage-a/node-b",
+            Vec::new(),
+            tool_exec_with_ref(run_state_ref_value("/missing")),
+        );
+        let node_states = HashMap::new();
+        let stage_states = HashMap::from([(
+            "stage-a".to_string(),
+            StageRuntimeState {
+                status: StageRuntimeStatus::Committed,
+            },
+        )]);
+        let contract = ValidatedContractManifest {
+            stage_order: vec!["stage-a".to_string()],
+        };
+        let store = InMemoryStateStore::new();
+
+        let next = evaluate_node_readiness(
+            "run-1",
+            &node,
+            &pending_state(),
+            &node_states,
+            &stage_states,
+            &contract,
+            &store,
+        );
+        assert_eq!(next.status, NodeRuntimeStatus::Pending);
+        assert!(
+            next.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resolution failed")
+        );
+    }
+
+    #[test]
+    fn evaluate_node_readiness_blocks_on_uncommitted_stage() {
+        let node = node_spec(
+            "stage-b/node-b",
+            Vec::new(),
+            tool_exec_with_ref(run_state_ref_value("/input")),
+        );
+        let node_states = HashMap::new();
+        let stage_states = HashMap::from([
+            (
+                "stage-a".to_string(),
+                StageRuntimeState {
+                    status: StageRuntimeStatus::Active,
+                },
+            ),
+            (
+                "stage-b".to_string(),
+                StageRuntimeState {
+                    status: StageRuntimeStatus::Pending,
+                },
+            ),
+        ]);
+        let contract = ValidatedContractManifest {
+            stage_order: vec!["stage-a".to_string(), "stage-b".to_string()],
+        };
+        let store = InMemoryStateStore::new();
+
+        let next = evaluate_node_readiness(
+            "run-1",
+            &node,
+            &pending_state(),
+            &node_states,
+            &stage_states,
+            &contract,
+            &store,
+        );
+        assert_eq!(next.status, NodeRuntimeStatus::Pending);
+        assert!(
+            next.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("upstream stage")
+        );
+    }
+
+    #[test]
+    fn evaluate_node_readiness_sets_ready_when_all_checks_pass() {
+        let node = node_spec(
+            "stage-a/node-b",
+            vec!["stage-a/node-a"],
+            tool_exec_with_ref(run_state_ref_value("/input")),
+        );
+        let mut node_states = HashMap::new();
+        node_states.insert(
+            "stage-a/node-a".to_string(),
+            NodeRuntimeState {
+                status: NodeRuntimeStatus::Succeeded,
+                last_error: None,
+            },
+        );
+        let stage_states = HashMap::from([(
+            "stage-a".to_string(),
+            StageRuntimeState {
+                status: StageRuntimeStatus::Committed,
+            },
+        )]);
+        let contract = ValidatedContractManifest {
+            stage_order: vec!["stage-a".to_string()],
+        };
+        let store = InMemoryStateStore::new();
+        store
+            .apply_state_put("run-1", "RUN", None, "/input", json!("ok"))
+            .expect("state put");
+
+        let next = evaluate_node_readiness(
+            "run-1",
+            &node,
+            &pending_state(),
+            &node_states,
+            &stage_states,
+            &contract,
+            &store,
+        );
+        assert_eq!(next.status, NodeRuntimeStatus::Ready);
+        assert!(next.last_error.is_none());
     }
 
     fn build_manifest(stages: serde_json::Value) -> serde_json::Value {
