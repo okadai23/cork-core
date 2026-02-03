@@ -408,10 +408,10 @@ CORE-020
 
 ### サブタスク
 
-- [ ] schema検証
-- [ ] resource_pools を ResourceManager 初期化用に正規化
-- [ ] scheduler.modeはMVPでは LIST_HEURISTIC のみ実装
-- [ ] stage_auto_commit 設定を RunCtx に格納
+- [x] schema検証
+- [x] resource_pools を ResourceManager 初期化用に正規化
+- [x] scheduler.modeはMVPでは LIST_HEURISTIC のみ実装
+- [x] stage_auto_commit 設定を RunCtx に格納
 
 ### DoD
 
@@ -419,8 +419,14 @@ CORE-020
 
 ### Acceptance Criteria
 
-- [ ] 欠落・型違いを検出して拒否
-- [ ] `resource_pools` が内部に登録され、後続のresource予約が可能
+- [x] 欠落・型違いを検出して拒否
+- [x] `resource_pools` が内部に登録され、後続のresource予約が可能
+
+### 進捗
+
+- [DONE] Policy の schema/論理検証と resource_pools 正規化、RunCtx への stage_auto_commit 格納を実装。
+  - 変更ファイル: `crates/cork-schema/src/lib.rs`, `crates/cork-core/src/engine/run.rs`, `crates/cork-store/src/lib.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 ---
 
