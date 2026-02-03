@@ -675,15 +675,15 @@ CORE-030, CORE-022
 
 ### サブタスク
 
-- [ ] NodeRuntimeState:
+- [x] NodeRuntimeState:
   - status（PENDING/READY/RUNNING/…）
   - last_error
-- [ ] deps終端条件:
+- [x] deps終端条件:
   - SUCCEEDEDのみで良いか、FAILEDでも進めるか（MVPはSUCCEEDEDのみ推奨）
-- [ ] 参照解決の "事前チェック":
+- [x] 参照解決の "事前チェック":
   - tool/llm input内の ref をすべて `resolve_value_ref` してみる
   - 1つでも不可→READYにしない
-- [ ] stage順序:
+- [x] stage順序:
   - upstream stages が COMMITTED でなければ、このstageのノードをREADYにしない
 
 ### DoD
@@ -692,9 +692,15 @@ CORE-030, CORE-022
 
 ### Acceptance Criteria
 
-- [ ] deps未完了 → READYにならない
-- [ ] ref解決不可 → READYにならない
-- [ ] 上流stageが未完了なのに下流stage内nodeをREADYにしない
+- [x] deps未完了 → READYにならない
+- [x] ref解決不可 → READYにならない
+- [x] 上流stageが未完了なのに下流stage内nodeをREADYにしない
+
+### 進捗
+
+- [DONE] READY判定の評価ロジックとRuntimeState構造体を追加し、deps/ref/stage順序の判定テストを実装。
+- 変更ファイル: `crates/cork-core/src/engine/run.rs`、`docs/tasks.md`。
+- 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
