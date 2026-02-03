@@ -582,15 +582,15 @@ CORE-026
 
 ### サブタスク
 
-- [ ] `resolve_value_ref(ref: ValueRef, store: &StateStore) -> ResolvedValue`
-- [ ] RUN_STATE / STAGE_STATE:
+- [x] `resolve_value_ref(ref: ValueRef, store: &StateStore) -> ResolvedValue`
+- [x] RUN_STATE / STAGE_STATE:
   - JSON Value に対して `.pointer(ptr)` で取得
-- [ ] NODE_OUTPUT:
+- [x] NODE_OUTPUT:
   - `is_json == true` のときだけ `.pointer(ptr)` を許可
   - `is_json == false` の場合は `ptr=="" && render_as==TEXT` のみ許可
-- [ ] NODE_ARTIFACT:
+- [x] NODE_ARTIFACT:
   - artifacts[artifact_index] を返す
-- [ ] エラー型:
+- [x] エラー型:
   - InvalidPointerSyntax（採用するなら json-pointer で parse）
   - NotFound / TypeMismatch / NotJsonOutput など
 
@@ -600,9 +600,15 @@ CORE-026
 
 ### Acceptance Criteria
 
-- [ ] RUN_STATEにSTATE_PUTした値を `/path/to/value` で参照できる
-- [ ] 不正ポインタ（構文不正）→ 参照解決エラーになる（ノードはREADYにならない）
-- [ ] 非JSON NODE_OUTPUTで pointer!="" → 解決失敗
+- [x] RUN_STATEにSTATE_PUTした値を `/path/to/value` で参照できる
+- [x] 不正ポインタ（構文不正）→ 参照解決エラーになる（ノードはREADYにならない）
+- [x] 非JSON NODE_OUTPUTで pointer!="" → 解決失敗
+
+### 進捗
+
+- [DONE] JSON Pointer参照解決の実装とエラー型定義を追加。
+- 変更ファイル: `crates/cork-core/src/engine/refs.rs`, `crates/cork-core/src/engine/mod.rs`, `crates/cork-store/src/lib.rs`。
+- 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
