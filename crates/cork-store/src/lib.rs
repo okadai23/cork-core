@@ -90,6 +90,16 @@ impl RunCtx {
         metadata.updated_at = SystemTime::now();
     }
 
+    pub fn try_advance_patch_seq(&self, expected: u64) -> Result<u64, u64> {
+        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        if metadata.next_patch_seq != expected {
+            return Err(metadata.next_patch_seq);
+        }
+        metadata.next_patch_seq = metadata.next_patch_seq.saturating_add(1);
+        metadata.updated_at = SystemTime::now();
+        Ok(metadata.next_patch_seq)
+    }
+
     pub fn advance_patch_seq(&self) -> u64 {
         let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
         metadata.next_patch_seq = metadata.next_patch_seq.saturating_add(1);
@@ -400,6 +410,19 @@ mod tests {
                 exclude_when_waiting: false,
             })
         );
+    }
+
+    #[test]
+    fn try_advance_patch_seq_is_atomic() {
+        let registry = InMemoryRunRegistry::new();
+        let run = registry.create_run(CreateRunInput {
+            next_patch_seq: Some(0),
+            ..Default::default()
+        });
+
+        assert_eq!(run.try_advance_patch_seq(0), Ok(1));
+        assert_eq!(run.try_advance_patch_seq(0), Err(1));
+        assert_eq!(run.try_advance_patch_seq(1), Ok(2));
     }
 
     #[test]

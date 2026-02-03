@@ -471,6 +471,7 @@ CORE-022, CORE-010
 - [DONE] ApplyGraphPatchの検証とRunCtx拡張を実装。
   - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-core/src/engine/patch.rs`。
   - 検証: `make fmt`, `make lint`, `make test`。
+  - 追記: patch_seq の原子比較/更新を追加。
 
 ---
 

@@ -359,14 +359,6 @@ impl CorkCore for CorkCoreService {
             Ok(metadata) => metadata,
             Err(reason) => return Ok(Response::new(reject_response(reason))),
         };
-        if metadata.patch_seq != run_ctx.next_patch_seq() {
-            return Ok(Response::new(reject_response(
-                GraphPatchRejectionReason::PatchSeqMismatch {
-                    expected: run_ctx.next_patch_seq(),
-                    provided: metadata.patch_seq,
-                },
-            )));
-        }
         if run_ctx.active_stage_id().as_deref() != Some(&metadata.stage_id) {
             return Ok(Response::new(reject_response(
                 GraphPatchRejectionReason::StageNotActive {
@@ -398,7 +390,14 @@ impl CorkCore for CorkCoreService {
                 }
             }
         }
-        run_ctx.set_next_patch_seq(metadata.patch_seq.saturating_add(1));
+        if let Err(expected) = run_ctx.try_advance_patch_seq(metadata.patch_seq) {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::PatchSeqMismatch {
+                    expected,
+                    provided: metadata.patch_seq,
+                },
+            )));
+        }
         Ok(Response::new(ApplyGraphPatchResponse {
             accepted: true,
             rejection_reason: String::new(),
