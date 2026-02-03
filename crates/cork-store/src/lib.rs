@@ -35,6 +35,8 @@ pub struct RunMetadata {
     pub next_patch_seq: u64,
     pub active_stage_id: Option<String>,
     pub active_stage_expansion_policy: Option<ExpansionPolicy>,
+    pub stage_started_at: Option<SystemTime>,
+    pub last_patch_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +134,38 @@ impl RunCtx {
             .clone()
     }
 
+    pub fn stage_started_at(&self) -> Option<SystemTime> {
+        self.metadata
+            .read()
+            .expect("run metadata lock poisoned")
+            .stage_started_at
+    }
+
+    pub fn last_patch_at(&self) -> Option<SystemTime> {
+        self.metadata
+            .read()
+            .expect("run metadata lock poisoned")
+            .last_patch_at
+    }
+
+    pub fn set_stage_started_at(&self, stage_started_at: Option<SystemTime>) {
+        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        metadata.stage_started_at = stage_started_at;
+        metadata.updated_at = SystemTime::now();
+    }
+
+    pub fn set_last_patch_at(&self, last_patch_at: Option<SystemTime>) {
+        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        metadata.last_patch_at = last_patch_at;
+        metadata.updated_at = SystemTime::now();
+    }
+
+    pub fn touch_stage_patch(&self) {
+        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        metadata.last_patch_at = Some(SystemTime::now());
+        metadata.updated_at = SystemTime::now();
+    }
+
     pub fn set_active_stage(
         &self,
         active_stage_id: Option<String>,
@@ -140,6 +174,14 @@ impl RunCtx {
         let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
         metadata.active_stage_id = active_stage_id;
         metadata.active_stage_expansion_policy = active_stage_expansion_policy;
+        if metadata.active_stage_id.is_some() {
+            let now = SystemTime::now();
+            metadata.stage_started_at = Some(now);
+            metadata.last_patch_at = Some(now);
+        } else {
+            metadata.stage_started_at = None;
+            metadata.last_patch_at = None;
+        }
         metadata.updated_at = SystemTime::now();
     }
 
@@ -166,6 +208,8 @@ pub struct CreateRunInput {
     pub next_patch_seq: Option<u64>,
     pub active_stage_id: Option<String>,
     pub active_stage_expansion_policy: Option<ExpansionPolicy>,
+    pub stage_started_at: Option<SystemTime>,
+    pub last_patch_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -595,6 +639,16 @@ impl RunRegistry for InMemoryRunRegistry {
     fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx> {
         let run_id = generate_run_id();
         let now = SystemTime::now();
+        let mut stage_started_at = input.stage_started_at;
+        let mut last_patch_at = input.last_patch_at;
+        if input.active_stage_id.is_some() {
+            if stage_started_at.is_none() {
+                stage_started_at = Some(now);
+            }
+            if last_patch_at.is_none() {
+                last_patch_at = stage_started_at;
+            }
+        }
         let metadata = RunMetadata {
             created_at: now,
             updated_at: now,
@@ -606,6 +660,8 @@ impl RunRegistry for InMemoryRunRegistry {
             next_patch_seq: input.next_patch_seq.unwrap_or(0),
             active_stage_id: input.active_stage_id,
             active_stage_expansion_policy: input.active_stage_expansion_policy,
+            stage_started_at,
+            last_patch_at,
         };
         let run_ctx = Arc::new(RunCtx::new(run_id.clone(), metadata));
 
@@ -771,17 +827,13 @@ mod tests {
         let run = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-1".to_string()),
             variant_id: Some("var-1".to_string()),
-            status: None,
-            hash_bundle: None,
             stage_auto_commit: Some(StageAutoCommitPolicy {
                 enabled: true,
                 quiescence_ms: 10,
                 max_open_ms: 20,
                 exclude_when_waiting: false,
             }),
-            next_patch_seq: None,
-            active_stage_id: None,
-            active_stage_expansion_policy: None,
+            ..Default::default()
         });
 
         let fetched = registry.get_run(run.run_id()).expect("run exists");
@@ -825,33 +877,18 @@ mod tests {
         let registry = InMemoryRunRegistry::new();
         let run_a = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-1".to_string()),
-            variant_id: None,
             status: Some(RunStatus::RunPending),
-            hash_bundle: None,
-            stage_auto_commit: None,
-            next_patch_seq: None,
-            active_stage_id: None,
-            active_stage_expansion_policy: None,
+            ..Default::default()
         });
         let _run_b = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-1".to_string()),
-            variant_id: None,
             status: Some(RunStatus::RunRunning),
-            hash_bundle: None,
-            stage_auto_commit: None,
-            next_patch_seq: None,
-            active_stage_id: None,
-            active_stage_expansion_policy: None,
+            ..Default::default()
         });
         let run_c = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-2".to_string()),
-            variant_id: None,
             status: Some(RunStatus::RunPending),
-            hash_bundle: None,
-            stage_auto_commit: None,
-            next_patch_seq: None,
-            active_stage_id: None,
-            active_stage_expansion_policy: None,
+            ..Default::default()
         });
 
         let page1 = registry.list_runs(

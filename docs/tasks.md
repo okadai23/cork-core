@@ -825,17 +825,17 @@ CORE-034
 
 ### サブタスク
 
-- [ ] stage metadata:
+- [x] stage metadata:
   - stage_started_at
   - last_patch_at
-- [ ] 判定:
+- [x] 判定:
   - PRE/WITHINが全終端
   - now - last_patch_at >= quiescence_ms
   - now - stage_started_at <= max_open_ms（超えた場合のポリシー：MVPは強制commit推奨）
-- [ ] commit実行:
+- [x] commit実行:
   - StageLifecycleEvent emit（ACTIVE→COMMITTED）
   - 次stageをACTIVEへ
-- [ ] tick戦略:
+- [x] tick戦略:
   - Supervisorが `tokio::time::interval(200ms〜1s)` でTick
 
 ### DoD
@@ -844,8 +844,15 @@ CORE-034
 
 ### Acceptance Criteria
 
-- [ ] quiescence条件で COMMITTED に遷移し、次stageがACTIVEになる
-- [ ] UIが StageLifecycleEvent を見てステージ進行を復元できる
+- [x] quiescence条件で COMMITTED に遷移し、次stageがACTIVEになる
+- [x] UIが StageLifecycleEvent を見てステージ進行を復元できる
+
+### 進捗
+
+- [DONE] Stage auto-commit の判定ロジックとメタデータ更新を追加。
+- [DONE] GraphPatchがアクティブステージに触れた時のみ last_patch_at を更新するよう修正。
+- 変更ファイル: `crates/cork-core/src/engine/autocommit.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-store/src/lib.rs`, `crates/cork-core/src/engine/run.rs`。
+- 検証: `make fmt`, `make lint`, `make test`。
 
 ---
 

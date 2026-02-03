@@ -381,7 +381,7 @@ fn parse_value_ref(run_id: &str, value: &Value) -> Result<ValueRef, String> {
     })
 }
 
-fn node_stage_id(node_id: &str) -> Option<&str> {
+pub(crate) fn node_stage_id(node_id: &str) -> Option<&str> {
     let mut parts = node_id.split('/');
     parts.next().filter(|value| !value.is_empty())
 }
@@ -616,11 +616,7 @@ mod tests {
             experiment_id: Some("exp".to_string()),
             variant_id: Some("var".to_string()),
             status: Some(RunStatus::RunRunning),
-            hash_bundle: None,
-            stage_auto_commit: None,
-            next_patch_seq: None,
-            active_stage_id: None,
-            active_stage_expansion_policy: None,
+            ..Default::default()
         });
 
         let response = run_ctx_to_response(&run);
@@ -670,23 +666,13 @@ mod tests {
         let registry = InMemoryRunRegistry::new();
         registry.create_run(CreateRunInput {
             experiment_id: Some("exp-1".to_string()),
-            variant_id: None,
             status: Some(RunStatus::RunPending),
-            hash_bundle: None,
-            stage_auto_commit: None,
-            next_patch_seq: None,
-            active_stage_id: None,
-            active_stage_expansion_policy: None,
+            ..Default::default()
         });
         registry.create_run(CreateRunInput {
             experiment_id: Some("exp-2".to_string()),
-            variant_id: None,
             status: Some(RunStatus::RunPending),
-            hash_bundle: None,
-            stage_auto_commit: None,
-            next_patch_seq: None,
-            active_stage_id: None,
-            active_stage_expansion_policy: None,
+            ..Default::default()
         });
 
         let page = registry.list_runs(
