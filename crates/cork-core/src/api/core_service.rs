@@ -461,6 +461,7 @@ impl CorkCore for CorkCoreService {
             )));
         }
         run_ctx.advance_patch_seq();
+        run_ctx.touch_stage_patch();
         let event = RunEvent {
             event_seq: 0,
             ts: Some(system_time_to_timestamp(SystemTime::now())),
