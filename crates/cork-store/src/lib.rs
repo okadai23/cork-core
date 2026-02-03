@@ -16,6 +16,12 @@ use cork_proto::cork::v1::{HashBundle, RunEvent, RunStatus};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpansionPolicy {
+    pub allow_dynamic: bool,
+    pub allow_kinds: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunMetadata {
     pub created_at: SystemTime,
@@ -25,6 +31,9 @@ pub struct RunMetadata {
     pub experiment_id: Option<String>,
     pub variant_id: Option<String>,
     pub stage_auto_commit: Option<StageAutoCommitPolicy>,
+    pub next_patch_seq: u64,
+    pub active_stage_id: Option<String>,
+    pub active_stage_expansion_policy: Option<ExpansionPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +77,53 @@ impl RunCtx {
             .clone()
     }
 
+    pub fn next_patch_seq(&self) -> u64 {
+        self.metadata
+            .read()
+            .expect("run metadata lock poisoned")
+            .next_patch_seq
+    }
+
+    pub fn set_next_patch_seq(&self, next_patch_seq: u64) {
+        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        metadata.next_patch_seq = next_patch_seq;
+        metadata.updated_at = SystemTime::now();
+    }
+
+    pub fn advance_patch_seq(&self) -> u64 {
+        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        metadata.next_patch_seq = metadata.next_patch_seq.saturating_add(1);
+        metadata.updated_at = SystemTime::now();
+        metadata.next_patch_seq
+    }
+
+    pub fn active_stage_id(&self) -> Option<String> {
+        self.metadata
+            .read()
+            .expect("run metadata lock poisoned")
+            .active_stage_id
+            .clone()
+    }
+
+    pub fn active_stage_expansion_policy(&self) -> Option<ExpansionPolicy> {
+        self.metadata
+            .read()
+            .expect("run metadata lock poisoned")
+            .active_stage_expansion_policy
+            .clone()
+    }
+
+    pub fn set_active_stage(
+        &self,
+        active_stage_id: Option<String>,
+        active_stage_expansion_policy: Option<ExpansionPolicy>,
+    ) {
+        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        metadata.active_stage_id = active_stage_id;
+        metadata.active_stage_expansion_policy = active_stage_expansion_policy;
+        metadata.updated_at = SystemTime::now();
+    }
+
     pub fn set_status(&self, status: RunStatus) {
         let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
         metadata.status = status;
@@ -88,6 +144,9 @@ pub struct CreateRunInput {
     pub status: Option<RunStatus>,
     pub hash_bundle: Option<HashBundle>,
     pub stage_auto_commit: Option<StageAutoCommitPolicy>,
+    pub next_patch_seq: Option<u64>,
+    pub active_stage_id: Option<String>,
+    pub active_stage_expansion_policy: Option<ExpansionPolicy>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,6 +198,9 @@ impl RunRegistry for InMemoryRunRegistry {
             experiment_id: input.experiment_id,
             variant_id: input.variant_id,
             stage_auto_commit: input.stage_auto_commit,
+            next_patch_seq: input.next_patch_seq.unwrap_or(0),
+            active_stage_id: input.active_stage_id,
+            active_stage_expansion_policy: input.active_stage_expansion_policy,
         };
         let run_ctx = Arc::new(RunCtx::new(run_id.clone(), metadata));
 
@@ -312,6 +374,9 @@ mod tests {
                 max_open_ms: 20,
                 exclude_when_waiting: false,
             }),
+            next_patch_seq: None,
+            active_stage_id: None,
+            active_stage_expansion_policy: None,
         });
 
         let fetched = registry.get_run(run.run_id()).expect("run exists");
@@ -346,6 +411,9 @@ mod tests {
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
             stage_auto_commit: None,
+            next_patch_seq: None,
+            active_stage_id: None,
+            active_stage_expansion_policy: None,
         });
         let _run_b = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-1".to_string()),
@@ -353,6 +421,9 @@ mod tests {
             status: Some(RunStatus::RunRunning),
             hash_bundle: None,
             stage_auto_commit: None,
+            next_patch_seq: None,
+            active_stage_id: None,
+            active_stage_expansion_policy: None,
         });
         let run_c = registry.create_run(CreateRunInput {
             experiment_id: Some("exp-2".to_string()),
@@ -360,6 +431,9 @@ mod tests {
             status: Some(RunStatus::RunPending),
             hash_bundle: None,
             stage_auto_commit: None,
+            next_patch_seq: None,
+            active_stage_id: None,
+            active_stage_expansion_policy: None,
         });
 
         let page1 = registry.list_runs(
