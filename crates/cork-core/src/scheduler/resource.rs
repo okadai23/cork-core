@@ -106,6 +106,7 @@ impl ResourceId {
 #[derive(Debug, Clone)]
 struct ResourcePool {
     kind: ResourcePoolKind,
+    capacity: u32,
     semaphore: Arc<Semaphore>,
 }
 
@@ -215,6 +216,13 @@ impl ResourceManager {
                     amount: request.amount,
                 });
             }
+            if request.amount > pool.capacity {
+                Self::release_allocations(&mut allocations);
+                return Err(ResourceManagerError::InvalidAmount {
+                    resource_id: request.resource_id.clone(),
+                    amount: request.amount,
+                });
+            }
             let permits = request.amount;
             let permit = match pool.semaphore.try_acquire_many(permits) {
                 Ok(permit) => permit,
@@ -256,10 +264,13 @@ impl ResourceManager {
         };
         let permits = usize::try_from(effective_capacity)
             .map_err(|_| ResourceManagerError::CapacityTooLarge(resource_id.clone()))?;
+        let capacity = u32::try_from(effective_capacity)
+            .map_err(|_| ResourceManagerError::CapacityTooLarge(resource_id.clone()))?;
         pools.insert(
             resource_id,
             ResourcePool {
                 kind,
+                capacity,
                 semaphore: Arc::new(Semaphore::new(permits)),
             },
         );
@@ -360,5 +371,28 @@ mod tests {
         assert!(second.is_none());
 
         drop(reservation);
+    }
+
+    #[test]
+    fn rejects_request_exceeding_pool_capacity() {
+        let pools = vec![ResourcePoolSpec {
+            resource_id: "tool:alpha".to_string(),
+            capacity: 2,
+            kind: ResourcePoolKind::Cumulative,
+            tags: Vec::new(),
+        }];
+        let manager = ResourceManager::new(default_limits(), Vec::new(), pools)
+            .expect("resource manager build");
+
+        let request = ResourceRequest {
+            resource_id: "tool:alpha".to_string(),
+            amount: 3,
+        };
+
+        let result = manager.try_reserve(std::slice::from_ref(&request), &[]);
+        assert!(matches!(
+            result,
+            Err(ResourceManagerError::InvalidAmount { .. })
+        ));
     }
 }

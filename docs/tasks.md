@@ -752,6 +752,9 @@ CORE-023, CORE-026
 - [DONE] ResourceManagerのプール初期化、予約/解放、alternatives選択の実装とユニットテストを追加。
   - 変更ファイル: `crates/cork-core/src/scheduler/resource.rs`, `crates/cork-core/src/scheduler/mod.rs`, `crates/cork-core/src/lib.rs`, `docs/tasks.md`。
   - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] リクエスト量がプール容量を超える場合に恒久的エラーで返すよう修正し、容量超過テストを追加。
+  - 変更ファイル: `crates/cork-core/src/scheduler/resource.rs`, `docs/tasks.md`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
