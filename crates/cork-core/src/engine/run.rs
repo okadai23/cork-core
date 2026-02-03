@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cork_proto::cork::v1::{GetRunResponse, RunHandle, RunStatus};
-use cork_store::{RunCtx, RunRegistry, StageAutoCommitPolicy};
+use cork_store::{
+    ArtifactRef, NodeOutput, NodePayload, RunCtx, RunRegistry, StageAutoCommitPolicy, StateStore,
+};
 use prost_types::Timestamp;
 use serde_json::Value;
 
@@ -38,6 +40,18 @@ fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
 
 pub fn map_proto_status(status: i32) -> Option<RunStatus> {
     RunStatus::try_from(status).ok()
+}
+
+pub fn record_node_output(
+    state_store: &dyn StateStore,
+    run_id: &str,
+    node_id: &str,
+    payload: NodePayload,
+    artifacts: Vec<ArtifactRef>,
+) -> NodeOutput {
+    let output = NodeOutput::from_payload(payload, artifacts);
+    state_store.set_node_output(run_id, node_id, output.clone());
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,7 +344,7 @@ fn parse_stage_auto_commit(value: &Value) -> Result<StageAutoCommitPolicy, Polic
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cork_store::{CreateRunInput, InMemoryRunRegistry, RunFilters};
+    use cork_store::{CreateRunInput, InMemoryRunRegistry, InMemoryStateStore, RunFilters};
     use serde_json::json;
 
     #[test]
@@ -367,6 +381,26 @@ mod tests {
             Some(RunStatus::RunPending)
         );
         assert!(map_proto_status(999).is_none());
+    }
+
+    #[test]
+    fn record_node_output_stores_payload_and_parsed_json() {
+        let store = InMemoryStateStore::new();
+        let output = record_node_output(
+            &store,
+            "run-1",
+            "node-1",
+            NodePayload {
+                content_type: "application/json".to_string(),
+                data: br#"{"value": 1}"#.to_vec(),
+            },
+            Vec::new(),
+        );
+
+        assert!(output.is_json());
+        assert_eq!(output.parsed_json, Some(json!({ "value": 1 })));
+        let stored = store.node_output("run-1", "node-1").expect("stored output");
+        assert_eq!(stored, output);
     }
 
     #[test]

@@ -632,10 +632,10 @@ CORE-026
 
 ### サブタスク
 
-- [ ] `run_state: serde_json::Value`（Objectで開始）
-- [ ] `stage_state: HashMap<StageId, Value>`
-- [ ] `node_outputs: HashMap<NodeId, NodeOutput>`
-- [ ] NodeOutput:
+- [x] `run_state: serde_json::Value`（Objectで開始）
+- [x] `stage_state: HashMap<StageId, Value>`
+- [x] `node_outputs: HashMap<NodeId, NodeOutput>`
+- [x] NodeOutput:
   - payload bytes + content_type
   - parsed_json: Option<Value>（content_typeがjsonならparseして保持）
   - artifacts: Vec<ArtifactRef>
@@ -646,8 +646,14 @@ CORE-026
 
 ### Acceptance Criteria
 
-- [ ] ノード完了時に NodeOutput が保存される
-- [ ] `NODE_ARTIFACT` が `artifact_index` で参照できる
+- [x] ノード完了時に NodeOutput が保存される
+- [x] `NODE_ARTIFACT` が `artifact_index` で参照できる
+
+### 進捗
+
+- [DONE] NodeOutputのJSON判定と保存ヘルパを追加し、参照解決のテストを更新。
+- 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/engine/run.rs`, `crates/cork-core/src/engine/refs.rs`。
+- 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
