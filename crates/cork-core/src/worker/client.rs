@@ -136,7 +136,7 @@ fn build_request(
     if request.trace_context.is_none() {
         request.trace_context = context.trace_context.clone();
     }
-    if let Some(deadline) = context.budget.earliest_deadline() {
+    if let Some(deadline) = merge_deadline(request.deadline, context.budget.earliest_deadline()) {
         request.deadline = Some(system_time_to_timestamp(deadline));
     }
     let mut request = Request::new(request);
@@ -144,6 +144,19 @@ fn build_request(
         request.set_timeout(timeout);
     }
     request
+}
+
+fn merge_deadline(
+    request_deadline: Option<Timestamp>,
+    budget_deadline: Option<SystemTime>,
+) -> Option<SystemTime> {
+    let request_deadline = request_deadline.and_then(timestamp_to_system_time);
+    match (request_deadline, budget_deadline) {
+        (Some(request), Some(budget)) => Some(request.min(budget)),
+        (Some(request), None) => Some(request),
+        (None, Some(budget)) => Some(budget),
+        (None, None) => None,
+    }
 }
 
 fn handle_chunk(
@@ -274,6 +287,12 @@ fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
         seconds: duration.as_secs() as i64,
         nanos: duration.subsec_nanos() as i32,
     }
+}
+
+fn timestamp_to_system_time(timestamp: Timestamp) -> Option<SystemTime> {
+    let seconds = u64::try_from(timestamp.seconds).ok()?;
+    let nanos = u32::try_from(timestamp.nanos).ok()?;
+    Some(UNIX_EPOCH + Duration::new(seconds, nanos))
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -409,6 +428,29 @@ mod tests {
         assert_eq!(deadline, base + Duration::from_secs(2));
         let timeout = timeout_from_budget(base, &budget).expect("timeout");
         assert_eq!(timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn merge_deadline_prefers_earlier_request_deadline() {
+        let budget_deadline = UNIX_EPOCH + Duration::from_secs(20);
+        let request_deadline = system_time_to_timestamp(UNIX_EPOCH + Duration::from_secs(5));
+
+        let merged = merge_deadline(Some(request_deadline), Some(budget_deadline)).expect("merged");
+        assert_eq!(merged, UNIX_EPOCH + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn merge_deadline_uses_budget_when_request_missing() {
+        let budget_deadline = UNIX_EPOCH + Duration::from_secs(20);
+        let merged = merge_deadline(None, Some(budget_deadline)).expect("merged");
+        assert_eq!(merged, budget_deadline);
+    }
+
+    #[test]
+    fn merge_deadline_uses_request_when_budget_missing() {
+        let request_deadline = system_time_to_timestamp(UNIX_EPOCH + Duration::from_secs(5));
+        let merged = merge_deadline(Some(request_deadline), None).expect("merged");
+        assert_eq!(merged, UNIX_EPOCH + Duration::from_secs(5));
     }
 
     #[tokio::test]

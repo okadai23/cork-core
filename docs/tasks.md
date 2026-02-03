@@ -901,6 +901,7 @@ CORE-034
 
 - [DONE] CorkWorker クライアントと InvokeTool / InvokeToolStream の結果処理を追加。
 - [DONE] deadline算出と gRPC timeout 設定、ログ/失敗イベントの反映を実装。
+- [DONE] caller指定deadlineとbudgetを比較して早い方を採用するよう修正。
 - 変更ファイル: `crates/cork-core/src/worker/client.rs`, `crates/cork-core/src/worker/mod.rs`, `crates/cork-core/src/lib.rs`。
 - 検証: `make fmt`, `make lint`, `make test`。
 
