@@ -249,10 +249,11 @@ fn append_log(
     run_id: &str,
     stage_id: &str,
     node_id: &str,
-    log: LogRecord,
+    mut log: LogRecord,
     ts: Option<Timestamp>,
 ) {
     let timestamp = ts.or(log.ts).unwrap_or_else(now_timestamp);
+    log.ts = Some(timestamp);
     let log = log_store.append_log(run_id, stage_id, node_id, log);
     let event = RunEvent {
         event_seq: 0,
@@ -326,7 +327,7 @@ mod tests {
     use super::*;
     use cork_proto::cork::v1::cork_worker_server::{CorkWorker, CorkWorkerServer};
     use cork_proto::cork::v1::{InvokeToolRequest, InvokeToolResponse};
-    use cork_store::{InMemoryEventLog, InMemoryLogStore, InMemoryStateStore};
+    use cork_store::{InMemoryEventLog, InMemoryLogStore, InMemoryStateStore, LogStore};
     use std::pin::Pin;
     use tokio::net::TcpListener;
     use tokio_stream::Stream;
@@ -557,6 +558,10 @@ mod tests {
             Some(run_event::Event::Log(LogRecord { message, .. }))
                 if message == "stream-log"
         )));
+
+        let page = log_store.list_logs("run-2", None, cork_store::LogFilters::default(), 10);
+        assert_eq!(page.logs.len(), 1);
+        assert!(page.logs[0].ts.is_some());
 
         handle.abort();
     }

@@ -952,6 +952,8 @@ CORE-034
   - 変更ファイル: `crates/cork-core/src/api/core_service.rs`, `crates/cork-core/src/worker/client.rs`。
 - [DONE] LogStore/GetLogsのテストを追加。
   - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`。
+- [DONE] LogRecordのtsが保存されるようログ付与処理を補正。
+  - 変更ファイル: `crates/cork-core/src/worker/client.rs`。
 - 検証: `pre-commit run --all-files`, `make fmt`, `make lint`, `make test`。
 
 ---
