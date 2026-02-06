@@ -18,8 +18,8 @@ use cork_proto::cork::v1::{
     StreamRunEventsRequest, SubmitRunRequest, SubmitRunResponse, cork_core_server::CorkCore,
 };
 use cork_store::{
-    CreateRunInput, EventLog, InMemoryEventLog, InMemoryGraphStore, InMemoryRunRegistry,
-    InMemoryStateStore, RunCtx, RunRegistry,
+    CreateRunInput, EventLog, InMemoryEventLog, InMemoryGraphStore, InMemoryLogStore,
+    InMemoryRunRegistry, InMemoryStateStore, LogFilters, LogStore, RunCtx, RunRegistry,
 };
 use prost_types::Timestamp;
 use serde_json::Value;
@@ -33,6 +33,7 @@ use tonic::{Request, Response, Status};
 pub struct CorkCoreService {
     event_logs: Arc<RwLock<HashMap<String, Arc<InMemoryEventLog>>>>,
     graph_store: Arc<InMemoryGraphStore>,
+    log_store: Arc<InMemoryLogStore>,
     run_registry: Arc<dyn RunRegistry>,
     state_store: Arc<InMemoryStateStore>,
 }
@@ -47,6 +48,7 @@ impl CorkCoreService {
         Self {
             event_logs: Arc::new(RwLock::new(HashMap::new())),
             graph_store: Arc::new(InMemoryGraphStore::new()),
+            log_store: Arc::new(InMemoryLogStore::new()),
             run_registry,
             state_store: Arc::new(InMemoryStateStore::new()),
         }
@@ -72,6 +74,7 @@ impl Default for CorkCoreService {
         Self {
             event_logs: Arc::new(RwLock::new(HashMap::new())),
             graph_store: Arc::new(InMemoryGraphStore::new()),
+            log_store: Arc::new(InMemoryLogStore::new()),
             run_registry: Arc::new(InMemoryRunRegistry::new()),
             state_store: Arc::new(InMemoryStateStore::new()),
         }
@@ -613,9 +616,55 @@ impl CorkCore for CorkCoreService {
 
     async fn get_logs(
         &self,
-        _request: Request<GetLogsRequest>,
+        request: Request<GetLogsRequest>,
     ) -> Result<Response<GetLogsResponse>, Status> {
-        Err(Status::unimplemented("GetLogs not yet implemented"))
+        let request = request.into_inner();
+        let handle = request
+            .handle
+            .ok_or_else(|| Status::invalid_argument("missing run handle"))?;
+        if handle.run_id.is_empty() {
+            return Err(Status::invalid_argument("missing run_id"));
+        }
+        let page_size = if request.page_size > 0 {
+            request.page_size as usize
+        } else {
+            100
+        };
+        let page_token = if request.page_token.is_empty() {
+            None
+        } else {
+            Some(request.page_token.as_str())
+        };
+        let filters = LogFilters {
+            scope_id: if request.scope_id.is_empty() {
+                None
+            } else {
+                Some(request.scope_id)
+            },
+            span_id_hex: if request.span_id_hex.is_empty() {
+                None
+            } else {
+                Some(request.span_id_hex)
+            },
+            stage_id: if request.stage_id.is_empty() {
+                None
+            } else {
+                Some(request.stage_id)
+            },
+            node_id: if request.node_id.is_empty() {
+                None
+            } else {
+                Some(request.node_id)
+            },
+        };
+
+        let page = self
+            .log_store
+            .list_logs(&handle.run_id, page_token, filters, page_size);
+        Ok(Response::new(GetLogsResponse {
+            logs: page.logs,
+            next_page_token: page.next_page_token.unwrap_or_default(),
+        }))
     }
 }
 
@@ -623,10 +672,12 @@ impl CorkCore for CorkCoreService {
 mod tests {
     use super::*;
     use cork_proto::cork::v1::{
-        ApplyGraphPatchRequest, CanonicalJsonDocument, RunHandle, Sha256, StreamRunEventsRequest,
+        ApplyGraphPatchRequest, CanonicalJsonDocument, GetLogsRequest, LogRecord, RunHandle,
+        Sha256, StreamRunEventsRequest,
     };
     use cork_store::{
-        CreateRunInput, ExpansionPolicy, GraphStore, InMemoryRunRegistry, RunRegistry, StateStore,
+        CreateRunInput, ExpansionPolicy, GraphStore, InMemoryRunRegistry, LogStore, RunRegistry,
+        StateStore,
     };
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -1098,5 +1149,81 @@ mod tests {
         assert!(response.accepted);
         let updated = run.last_patch_at().expect("last_patch_at");
         assert!(updated > old);
+    }
+
+    #[tokio::test]
+    async fn get_logs_filters_by_scope_and_paginates() {
+        let service = CorkCoreService::new();
+        let run_id = "run-logs";
+        let first = service.log_store.append_log(
+            run_id,
+            "stage-a",
+            "node-a",
+            LogRecord {
+                level: "INFO".to_string(),
+                message: "first".to_string(),
+                trace_id_hex: "".to_string(),
+                span_id_hex: "span-a".to_string(),
+                scope_id: "".to_string(),
+                scope_seq: 0,
+                attrs: Default::default(),
+                ts: None,
+            },
+        );
+        service.log_store.append_log(
+            run_id,
+            "stage-a",
+            "node-a",
+            LogRecord {
+                level: "INFO".to_string(),
+                message: "second".to_string(),
+                trace_id_hex: "".to_string(),
+                span_id_hex: "span-a".to_string(),
+                scope_id: "".to_string(),
+                scope_seq: 0,
+                attrs: Default::default(),
+                ts: None,
+            },
+        );
+
+        let request = GetLogsRequest {
+            handle: Some(RunHandle {
+                run_id: run_id.to_string(),
+            }),
+            scope_id: first.scope_id.clone(),
+            span_id_hex: "span-a".to_string(),
+            stage_id: "stage-a".to_string(),
+            node_id: "node-a".to_string(),
+            page_size: 1,
+            page_token: String::new(),
+        };
+        let response = service
+            .get_logs(Request::new(request))
+            .await
+            .expect("get logs")
+            .into_inner();
+        assert_eq!(response.logs.len(), 1);
+        assert!(!response.next_page_token.is_empty());
+        assert_eq!(response.logs[0].scope_seq, 0);
+
+        let request = GetLogsRequest {
+            handle: Some(RunHandle {
+                run_id: run_id.to_string(),
+            }),
+            scope_id: first.scope_id,
+            span_id_hex: "span-a".to_string(),
+            stage_id: "stage-a".to_string(),
+            node_id: "node-a".to_string(),
+            page_size: 2,
+            page_token: response.next_page_token,
+        };
+        let response = service
+            .get_logs(Request::new(request))
+            .await
+            .expect("get logs page 2")
+            .into_inner();
+        assert_eq!(response.logs.len(), 1);
+        assert!(response.next_page_token.is_empty());
+        assert_eq!(response.logs[0].scope_seq, 1);
     }
 }

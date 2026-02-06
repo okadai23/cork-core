@@ -926,13 +926,13 @@ CORE-034
 
 ### サブタスク
 
-- [ ] LogRecordの付与:
+- [x] LogRecordの付与:
   - scope_id, scope_seq はCoreが採番して必ず埋める
-- [ ] 保存:
+- [x] 保存:
   - run_idごとに Vec<LogRecord>
-- [ ] GetLogsフィルタ:
+- [x] GetLogsフィルタ:
   - scope_id/span_id/stage_id/node_id で絞り込み
-- [ ] page_token（offset）実装
+- [x] page_token（offset）実装
 
 ### DoD
 
@@ -940,9 +940,21 @@ CORE-034
 
 ### Acceptance Criteria
 
-- [ ] scope_idを指定してログ取得できる
-- [ ] scope_seq が単調増加で付いている
-- [ ] ページングが機能する（page_token）
+- [x] scope_idを指定してログ取得できる
+- [x] scope_seq が単調増加で付いている
+- [x] ページングが機能する（page_token）
+
+### 進捗
+
+- [DONE] LogStoreの追加とscope_id/scope_seq採番、Run単位のログ保存を実装。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`。
+- [DONE] GetLogsのフィルタ・ページング実装とログ付与の連携を追加。
+  - 変更ファイル: `crates/cork-core/src/api/core_service.rs`, `crates/cork-core/src/worker/client.rs`。
+- [DONE] LogStore/GetLogsのテストを追加。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`。
+- [DONE] LogRecordのtsが保存されるようログ付与処理を補正。
+  - 変更ファイル: `crates/cork-core/src/worker/client.rs`。
+- 検証: `pre-commit run --all-files`, `make fmt`, `make lint`, `make test`。
 
 ---
 
