@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use cork_proto::cork::v1::{HashBundle, LogRecord, RunEvent, RunStatus};
+use cork_proto::cork::v1::{CanonicalJsonDocument, HashBundle, LogRecord, RunEvent, RunStatus};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -230,6 +230,80 @@ pub trait RunRegistry: Send + Sync {
     fn get_run(&self, run_id: &str) -> Option<Arc<RunCtx>>;
     fn list_runs(&self, page_token: Option<&str>, filters: RunFilters, page_size: usize)
     -> RunPage;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchStoreError {
+    PatchSeqMismatch { expected: u64, provided: u64 },
+}
+
+pub trait PatchStore: Send + Sync {
+    fn set_contract_manifest(&self, run_id: &str, contract: CanonicalJsonDocument);
+    fn contract_manifest(&self, run_id: &str) -> Option<CanonicalJsonDocument>;
+    fn append_patch(
+        &self,
+        run_id: &str,
+        patch_seq: u64,
+        patch: CanonicalJsonDocument,
+    ) -> Result<(), PatchStoreError>;
+    fn patches_in_order(&self, run_id: &str) -> Vec<CanonicalJsonDocument>;
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryPatchStore {
+    runs: RwLock<HashMap<String, PatchState>>,
+}
+
+#[derive(Debug, Default)]
+struct PatchState {
+    contract_manifest: Option<CanonicalJsonDocument>,
+    patches: Vec<CanonicalJsonDocument>,
+}
+
+impl InMemoryPatchStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PatchStore for InMemoryPatchStore {
+    fn set_contract_manifest(&self, run_id: &str, contract: CanonicalJsonDocument) {
+        let mut runs = self.runs.write().expect("patch store lock poisoned");
+        let state = runs.entry(run_id.to_string()).or_default();
+        state.contract_manifest = Some(contract);
+    }
+
+    fn contract_manifest(&self, run_id: &str) -> Option<CanonicalJsonDocument> {
+        let runs = self.runs.read().expect("patch store lock poisoned");
+        runs.get(run_id)
+            .and_then(|state| state.contract_manifest.clone())
+    }
+
+    fn append_patch(
+        &self,
+        run_id: &str,
+        patch_seq: u64,
+        patch: CanonicalJsonDocument,
+    ) -> Result<(), PatchStoreError> {
+        let mut runs = self.runs.write().expect("patch store lock poisoned");
+        let state = runs.entry(run_id.to_string()).or_default();
+        let expected = state.patches.len() as u64;
+        if patch_seq != expected {
+            return Err(PatchStoreError::PatchSeqMismatch {
+                expected,
+                provided: patch_seq,
+            });
+        }
+        state.patches.push(patch);
+        Ok(())
+    }
+
+    fn patches_in_order(&self, run_id: &str) -> Vec<CanonicalJsonDocument> {
+        let runs = self.runs.read().expect("patch store lock poisoned");
+        runs.get(run_id)
+            .map(|state| state.patches.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1029,6 +1103,41 @@ mod tests {
         assert_eq!(run.try_advance_patch_seq(0), Ok(1));
         assert_eq!(run.try_advance_patch_seq(0), Err(1));
         assert_eq!(run.try_advance_patch_seq(1), Ok(2));
+    }
+
+    #[test]
+    fn patch_store_keeps_patches_in_order() {
+        let store = InMemoryPatchStore::new();
+        let run_id = "run-patch";
+        let patch_zero = CanonicalJsonDocument {
+            canonical_json_utf8: br#"{"patch_seq":0}"#.to_vec(),
+            sha256: None,
+            schema_id: "cork.graph_patch.v0.1".to_string(),
+        };
+        let patch_one = CanonicalJsonDocument {
+            canonical_json_utf8: br#"{"patch_seq":1}"#.to_vec(),
+            sha256: None,
+            schema_id: "cork.graph_patch.v0.1".to_string(),
+        };
+
+        store
+            .append_patch(run_id, 0, patch_zero.clone())
+            .expect("append patch 0");
+        store
+            .append_patch(run_id, 1, patch_one.clone())
+            .expect("append patch 1");
+
+        let patches = store.patches_in_order(run_id);
+        assert_eq!(patches, vec![patch_zero, patch_one.clone()]);
+
+        let err = store.append_patch(run_id, 3, patch_one);
+        assert!(matches!(
+            err,
+            Err(PatchStoreError::PatchSeqMismatch {
+                expected: 2,
+                provided: 3
+            })
+        ));
     }
 
     #[test]

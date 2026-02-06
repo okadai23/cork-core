@@ -976,9 +976,9 @@ CORE-021, CORE-026
 
 ### サブタスク
 
-- [ ] patch列を patch_seq順で保持（VecでOK）
-- [ ] GetCompositeGraphで contract + patches を返却
-- [ ] composite_hashも同時返却
+- [x] patch列を patch_seq順で保持（VecでOK）
+- [x] GetCompositeGraphで contract + patches を返却
+- [x] composite_hashも同時返却
 
 ### DoD
 
@@ -986,8 +986,18 @@ CORE-021, CORE-026
 
 ### Acceptance Criteria
 
-- [ ] patches_in_order が patch_seq で 0..N の順に返る
-- [ ] 返したデータでクライアント側が composite_hash 再計算して一致（統合テスト）
+- [x] patches_in_order が patch_seq で 0..N の順に返る
+- [x] 返したデータでクライアント側が composite_hash 再計算して一致（統合テスト）
+
+### 進捗
+
+- [DONE] PatchStoreを追加し、patch_seq順での保存とcontract保持を実装。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`。
+- [DONE] GetCompositeGraphでcontract/patches/composite_hashを返却する実装とテストを追加。
+  - 変更ファイル: `crates/cork-core/src/api/core_service.rs`。
+- [DONE] PatchStore/GetCompositeGraphのユニットテストを追加。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`。
+- 検証: `pre-commit run --all-files`, `make fmt`, `make lint`, `make test`。
 
 ---
 
