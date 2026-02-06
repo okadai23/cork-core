@@ -584,6 +584,18 @@ impl CorkCore for CorkCoreService {
                 },
             )));
         }
+        let patch_store_expected = self
+            .patch_store
+            .patches_in_order(run_ctx.run_id())
+            .len() as u64;
+        if patch_store_expected != metadata.patch_seq {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::PatchSeqMismatch {
+                    expected: patch_store_expected,
+                    provided: metadata.patch_seq,
+                },
+            )));
+        }
         let stage_touch = match parse_stage_touch(&patch, &metadata.stage_id) {
             Ok(stage_touch) => stage_touch,
             Err(reason) => return Ok(Response::new(reject_response(reason))),
