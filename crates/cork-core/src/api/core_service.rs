@@ -9,17 +9,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::patch::apply_graph_patch_ops;
 use crate::engine::run::node_stage_id;
-use cork_hash::sha256;
+use cork_hash::{composite_graph_hash, contract_hash, patch_hash, sha256};
 use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
     ApplyGraphPatchRequest, ApplyGraphPatchResponse, CancelRunRequest, CancelRunResponse,
     CanonicalJsonDocument, GetCompositeGraphRequest, GetCompositeGraphResponse, GetLogsRequest,
-    GetLogsResponse, GetRunRequest, GetRunResponse, ListRunsRequest, ListRunsResponse, RunEvent,
-    StreamRunEventsRequest, SubmitRunRequest, SubmitRunResponse, cork_core_server::CorkCore,
+    GetLogsResponse, GetRunRequest, GetRunResponse, HashBundle, ListRunsRequest, ListRunsResponse,
+    RunEvent, Sha256, StreamRunEventsRequest, SubmitRunRequest, SubmitRunResponse,
+    cork_core_server::CorkCore,
 };
 use cork_store::{
     CreateRunInput, EventLog, InMemoryEventLog, InMemoryGraphStore, InMemoryLogStore,
-    InMemoryRunRegistry, InMemoryStateStore, LogFilters, LogStore, RunCtx, RunRegistry,
+    InMemoryPatchStore, InMemoryRunRegistry, InMemoryStateStore, LogFilters, LogStore, PatchStore,
+    RunCtx, RunRegistry,
 };
 use prost_types::Timestamp;
 use serde_json::Value;
@@ -34,6 +36,7 @@ pub struct CorkCoreService {
     event_logs: Arc<RwLock<HashMap<String, Arc<InMemoryEventLog>>>>,
     graph_store: Arc<InMemoryGraphStore>,
     log_store: Arc<InMemoryLogStore>,
+    patch_store: Arc<InMemoryPatchStore>,
     run_registry: Arc<dyn RunRegistry>,
     state_store: Arc<InMemoryStateStore>,
 }
@@ -49,6 +52,7 @@ impl CorkCoreService {
             event_logs: Arc::new(RwLock::new(HashMap::new())),
             graph_store: Arc::new(InMemoryGraphStore::new()),
             log_store: Arc::new(InMemoryLogStore::new()),
+            patch_store: Arc::new(InMemoryPatchStore::new()),
             run_registry,
             state_store: Arc::new(InMemoryStateStore::new()),
         }
@@ -75,6 +79,7 @@ impl Default for CorkCoreService {
             event_logs: Arc::new(RwLock::new(HashMap::new())),
             graph_store: Arc::new(InMemoryGraphStore::new()),
             log_store: Arc::new(InMemoryLogStore::new()),
+            patch_store: Arc::new(InMemoryPatchStore::new()),
             run_registry: Arc::new(InMemoryRunRegistry::new()),
             state_store: Arc::new(InMemoryStateStore::new()),
         }
@@ -175,6 +180,12 @@ fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
     Timestamp {
         seconds: duration.as_secs() as i64,
         nanos: duration.subsec_nanos() as i32,
+    }
+}
+
+fn bytes_to_sha256(bytes: &[u8; 32]) -> Sha256 {
+    Sha256 {
+        bytes32: bytes.to_vec(),
     }
 }
 
@@ -589,6 +600,16 @@ impl CorkCore for CorkCoreService {
                 },
             )));
         }
+        if let Err(err) =
+            self.patch_store
+                .append_patch(run_ctx.run_id(), metadata.patch_seq, patch.clone())
+        {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::InvalidPatch {
+                    message: format!("patch store error: {err:?}"),
+                },
+            )));
+        }
         run_ctx.advance_patch_seq();
         if stage_touch.touches_active_stage {
             run_ctx.touch_stage_patch();
@@ -607,11 +628,46 @@ impl CorkCore for CorkCoreService {
 
     async fn get_composite_graph(
         &self,
-        _request: Request<GetCompositeGraphRequest>,
+        request: Request<GetCompositeGraphRequest>,
     ) -> Result<Response<GetCompositeGraphResponse>, Status> {
-        Err(Status::unimplemented(
-            "GetCompositeGraph not yet implemented",
-        ))
+        let request = request.into_inner();
+        let handle = request
+            .handle
+            .ok_or_else(|| Status::invalid_argument("missing run handle"))?;
+        if handle.run_id.is_empty() {
+            return Err(Status::invalid_argument("missing run_id"));
+        }
+        let run_ctx = self
+            .run_registry
+            .get_run(&handle.run_id)
+            .ok_or_else(|| Status::not_found("run not found"))?;
+        let contract = self
+            .patch_store
+            .contract_manifest(&handle.run_id)
+            .ok_or_else(|| Status::not_found("contract manifest not found"))?;
+        let patches = self.patch_store.patches_in_order(&handle.run_id);
+        let contract_digest = contract_hash(&contract.canonical_json_utf8);
+        let patch_hashes: Vec<[u8; 32]> = patches
+            .iter()
+            .map(|patch| patch_hash(&patch.canonical_json_utf8))
+            .collect();
+        let composite = composite_graph_hash(&contract_digest, &patch_hashes);
+        let existing = run_ctx.metadata().hash_bundle;
+        let (policy_hash, run_config_hash) = existing
+            .as_ref()
+            .map(|bundle| (bundle.policy_hash.clone(), bundle.run_config_hash.clone()))
+            .unwrap_or((None, None));
+        let hashes = HashBundle {
+            contract_manifest_hash: Some(bytes_to_sha256(&contract_digest)),
+            policy_hash,
+            run_config_hash,
+            composite_graph_hash: Some(bytes_to_sha256(&composite)),
+        };
+        Ok(Response::new(GetCompositeGraphResponse {
+            contract_manifest: Some(contract),
+            patches_in_order: patches,
+            hashes: Some(hashes),
+        }))
     }
 
     async fn get_logs(
@@ -672,12 +728,12 @@ impl CorkCore for CorkCoreService {
 mod tests {
     use super::*;
     use cork_proto::cork::v1::{
-        ApplyGraphPatchRequest, CanonicalJsonDocument, GetLogsRequest, LogRecord, RunHandle,
-        Sha256, StreamRunEventsRequest,
+        ApplyGraphPatchRequest, CanonicalJsonDocument, GetCompositeGraphRequest, GetLogsRequest,
+        LogRecord, RunHandle, Sha256, StreamRunEventsRequest,
     };
     use cork_store::{
-        CreateRunInput, ExpansionPolicy, GraphStore, InMemoryRunRegistry, LogStore, RunRegistry,
-        StateStore,
+        CreateRunInput, ExpansionPolicy, GraphStore, InMemoryRunRegistry, LogStore, PatchStore,
+        RunRegistry, StateStore,
     };
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -708,6 +764,34 @@ mod tests {
             canonical_json_utf8,
             sha256: Some(build_sha256(&digest)),
             schema_id: "cork.graph_patch.v0.1".to_string(),
+        }
+    }
+
+    fn build_contract_document() -> CanonicalJsonDocument {
+        let payload = json!({
+            "schema_version": "cork.contract_manifest.v0.1",
+            "manifest_id": "manifest-1",
+            "contract_graph": {
+                "stages": [
+                    {
+                        "stage_id": "stage-a",
+                        "expansion_policy": {
+                            "allow_dynamic": true,
+                            "allow_kinds": ["LLM"],
+                            "max_dynamic_nodes": 1,
+                            "max_steps_in_stage": 1,
+                            "allow_cross_stage_deps": "NONE"
+                        }
+                    }
+                ]
+            }
+        });
+        let canonical_json_utf8 = serde_json::to_vec(&payload).expect("serialize contract payload");
+        let digest = sha256(&canonical_json_utf8);
+        CanonicalJsonDocument {
+            canonical_json_utf8,
+            sha256: Some(build_sha256(&digest)),
+            schema_id: "cork.contract_manifest.v0.1".to_string(),
         }
     }
 
@@ -1225,5 +1309,76 @@ mod tests {
         assert_eq!(response.logs.len(), 1);
         assert!(response.next_page_token.is_empty());
         assert_eq!(response.logs[0].scope_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn get_composite_graph_returns_contract_patches_and_hashes() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let contract = build_contract_document();
+        service
+            .patch_store
+            .set_contract_manifest(&handle.run_id, contract.clone());
+
+        let patch_zero =
+            build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("LLM")]));
+        let patch_one = build_patch_document(
+            &handle.run_id,
+            1,
+            "stage-a",
+            json!([node_added_op_with_id("node-2", "LLM")]),
+        );
+
+        for patch in [patch_zero.clone(), patch_one.clone()] {
+            let request = ApplyGraphPatchRequest {
+                handle: Some(handle.clone()),
+                patch: Some(patch),
+                actor_id: String::new(),
+            };
+            let response = service
+                .apply_graph_patch(Request::new(request))
+                .await
+                .expect("apply response")
+                .into_inner();
+            assert!(
+                response.accepted,
+                "rejection: {}",
+                response.rejection_reason
+            );
+        }
+
+        let request = GetCompositeGraphRequest {
+            handle: Some(handle),
+        };
+        let response = service
+            .get_composite_graph(Request::new(request))
+            .await
+            .expect("get composite graph")
+            .into_inner();
+
+        assert_eq!(response.contract_manifest.as_ref(), Some(&contract));
+        assert_eq!(response.patches_in_order.len(), 2);
+        let patch_seq: Vec<u64> = response
+            .patches_in_order
+            .iter()
+            .map(|patch| {
+                let value: Value =
+                    serde_json::from_slice(&patch.canonical_json_utf8).expect("patch json");
+                value
+                    .get("patch_seq")
+                    .and_then(|value| value.as_u64())
+                    .expect("patch_seq")
+            })
+            .collect();
+        assert_eq!(patch_seq, vec![0, 1]);
+
+        let contract_digest = contract_hash(&contract.canonical_json_utf8);
+        let patch_hashes = vec![
+            patch_hash(&patch_zero.canonical_json_utf8),
+            patch_hash(&patch_one.canonical_json_utf8),
+        ];
+        let expected = composite_graph_hash(&contract_digest, &patch_hashes);
+        let hashes = response.hashes.expect("hashes");
+        let composite_hash = hashes.composite_graph_hash.expect("composite hash").bytes32;
+        assert_eq!(composite_hash, expected.to_vec());
     }
 }
