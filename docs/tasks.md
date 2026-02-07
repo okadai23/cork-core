@@ -1224,3 +1224,495 @@ CORE-040 まで
 - **GraphPatchの検証（CORE-024/025）** は最初に固めると後工程が安定します
 - **event_seq/patch_seq** を強制すると、UIも実験管理も一気に楽になります
 - **参照式（CORE-030）** は "READY判定" と一体で作るとバグが減ります
+
+---
+
+# Post-MVP: Hardening / Ops / Correctness
+
+> 目的:
+> - MVPが「動く」状態から「落ちにくい」「再現できる」「運用できる」状態へ引き上げる
+> - Spec との齟齬/曖昧さを潰し、並列実行・順序保証・結果管理を“壊れない”形にする
+>
+> 参照:
+> - docs/specification.md
+> - docs/dod.md（共通DoD）
+> - docs/mvp.md
+
+---
+
+## 実装順（推奨）
+P0（バグ/性能劣化の芽）を先に全部潰す:
+1. CORE-100 (expansion_policy defaults)
+2. CORE-101 (std::sync ロック排除)
+3. CORE-103 (Patchの完全原子性)
+4. CORE-102 (policyの保存・取得)
+5. CORE-112 (backpressure/retention)
+6. CORE-150 (入力サイズ制限/クォータ)
+
+その後、運用耐性:
+7. CORE-111 (watchdog: TTL/idle/patch嵐)
+8. CORE-113 (worker呼び出しのresilience)
+9. CORE-141 (graceful shutdown / drain)
+10. CORE-110 (永続ストア / 再起動復元)
+
+観測性/将来拡張:
+11. CORE-120 (structured tracing/metrics)
+12. CORE-130 (Job-shop/SHOP3向けメタデータ拡張)
+13. CORE-143 (Spec conformance test suite)
+14. CORE-152 (fuzz / property tests)
+
+---
+
+# P0: Spec Correctness / 破綻防止（最優先）
+
+## [ ] CORE-100: expansion_policy の defaults フォールバック/マージ対応（Spec整合）
+**Priority:** P0  
+**Type:** Bugfix / Spec compliance  
+**Depends on:** 既存 SubmitRun 実装
+
+**Goal**
+- `stage.expansion_policy` が省略された正当な contract を SubmitRun が reject しない
+- `defaults.expansion_policy` を仕様通りに適用する
+
+**Scope**
+- `stage.expansion_policy` 優先
+- 無ければ `defaults.expansion_policy` を使用
+- 「defaults + stage override」のマージルールを明文化（allow_kindsの扱い等）
+
+**Subtasks**
+- [ ] `parse_expansion_policy` を修正し、stage->defaults の順で解決
+- [ ] マージルールを実装（最低限: stageが存在する場合はstageを採用、将来に備えて merge 関数を分離）
+- [ ] contract schema の該当箇所（defaults の定義）と整合を再確認
+- [ ] ユニットテスト追加:
+  - [ ] stage省略 + defaultsあり => OK
+  - [ ] stage省略 + defaultsなし => Reject（reason明確化）
+- [ ] E2E統合テストに defaults 省略ケースを追加（既存 minimal を置換 or 追加）
+
+**DoD**
+- テストで上記ケースが固定化され、今後の回帰を防ぐ
+- 拒否時のエラーが「何が足りないか」特定できる
+
+**Acceptance Criteria**
+- stage側 expansion_policy 省略の contract を SubmitRun が受理し、Run が開始できる
+
+**Tests**
+- unit: `parse_expansion_policy_*`
+- integ: `e2e_minimal_defaults_expansion_policy`
+
+**Docs**
+- docs/specification.md の該当章に「defaults適用順序」を追記
+
+
+---
+
+## [ ] CORE-101: async コンテキストの `std::sync::{Mutex,RwLock}` を排除（Tokioでブロックしない）
+**Priority:** P0  
+**Type:** Perf / Stability  
+**Depends on:** なし（独立、ただし広範囲変更）
+
+**Goal**
+- 高並列で gRPC が詰まる/レイテンシが跳ねる要因（ブロッキングロック）を排除する
+
+**Scope**
+- `std::sync::Mutex/RwLock` を棚卸しし、用途別に置換:
+  - マップ系: `dashmap::DashMap`
+  - 共有状態: `tokio::sync::{Mutex,RwLock}`
+  - Supervisor内の単一スレッド所有に寄せられるものはロック自体を消す
+
+**Subtasks**
+- [ ] 置換対象の一覧を作る（ファイル/型/保持時間）
+- [ ] `RunRegistry` / `PatchStore` / `EventLog` / `LogStore` のロックを非ブロッキング化
+- [ ] ロック保持時間を短縮（cloneしてから処理、など）
+- [ ] 並列テスト追加（apply_patch + stream_events + get_logs を同時に叩く）
+
+**DoD**
+- `cargo clippy -D warnings` を維持
+- 並列テストが安定して通る
+
+**Acceptance Criteria**
+- 100並列程度の混在アクセスでタイムアウト/ハングしない（CIで再現可能）
+
+**Tests**
+- `tokio::test` で負荷テスト（軽量）
+- 可能なら `loom`（P2でも可）
+
+**Docs**
+- docs/adr/ に「asyncロック方針」を1本追加（なぜDashMap/ tokio lock か）
+
+
+---
+
+## [ ] CORE-103: ApplyGraphPatch の完全原子性（partial applyを絶対に起こさない）
+**Priority:** P0  
+**Type:** Correctness / Data integrity  
+**Depends on:** CORE-101（推奨：ロック整理後の方が安全）
+
+**Goal**
+- Patch適用が失敗した場合に、Graph/State/PatchStore が“一部だけ更新された”状態を作らない
+
+**Scope**
+- Preflight（検証）と Commit（適用）を分離
+- 失敗パスで state/graph が変化しないことをテストで保証
+
+**Subtasks**
+- [ ] Patch適用を `validate_patch(...) -> ValidatedPatch` と `commit_patch(validated)` に分割
+- [ ] `commit_patch` は「全部適用できる」前提でのみ mutate
+- [ ] in-memory での実装案:
+  - [ ] Copy-on-write（cloneして適用→成功したらswap）
+  - [ ] もしくは transaction log を積んで最後に反映
+- [ ] 失敗ケースのテスト追加:
+  - [ ] ops途中で不正 node_id / edge / pointer が出る
+  - [ ] allow_kinds違反
+  - [ ] side_effect の key 欠落
+  - => いずれも graph/state が不変であることを検証
+
+**DoD**
+- 「rejectされたpatchで状態が変わらない」を統合テストで保証
+
+**Acceptance Criteria**
+- patchが reject された場合に `GetCompositeGraph` / `GetRun` の観測結果が変化しない
+
+**Tests**
+- unit: apply_patch_atomicity（before/after equality）
+- integ: “invalid patch then valid patch” の順で流しても壊れない
+
+**Docs**
+- docs/specification.md に「Patch原子性（all-or-nothing）」を明記
+
+
+---
+
+## [ ] CORE-102: SubmitRun で policy をストアへ保存し、取得可能にする（実験管理の土台）
+**Priority:** P0  
+**Type:** Correctness / Experiment reproducibility  
+**Depends on:** CORE-103（推奨：整合性ルールが固まってから）
+
+**Goal**
+- contract と policy が run_id から再取得でき、再現性の材料になる
+
+**Scope**
+- `set_policy(run_id, CanonicalJsonDocument)` / `get_policy(run_id)` をストアに追加
+- `GetRun` で policy hash / schema_id / sha256 を返す（返せない場合は GetPolicy API を追加）
+
+**Subtasks**
+- [ ] PatchStore（or RunStore）に policy 保存領域を追加
+- [ ] SubmitRun で policy を保存
+- [ ] GetRun で policyのhash bundle を返却（または `GetPolicy` RPCを追加）
+- [ ] テスト:
+  - [ ] SubmitRun -> GetRun で policy_hash が一致
+  - [ ] SubmitRun -> GetCompositeGraph の hash_bundle と整合
+
+**DoD**
+- runをキーに “policyを含む再現材料” が取れる
+
+**Acceptance Criteria**
+- 運用上「そのRunがどのpolicyで動いたか」を後から確実に追える
+
+**Docs**
+- docs/specification.md に policy保管の要件を追記
+
+
+---
+
+## [ ] CORE-112: StreamRunEvents / GetLogs の backpressure & retention（OOM防止）
+**Priority:** P0  
+**Type:** Stability / Availability  
+**Depends on:** CORE-101（推奨）
+
+**Goal**
+- ログ・イベントが大量に出てもメモリが無制限に増えない
+- 遅い購読者がいてもサーバが固まらない
+
+**Scope**
+- bounded channel（キュー上限）導入
+- retention（件数/バイト/期間）導入
+- slow subscriber の扱い方針を決める（drop / disconnect / latest-only）
+
+**Subtasks**
+- [ ] `EventLog` の broadcast/backlog を bounded 化（方針決定）
+- [ ] `LogStore` の保持上限（max_records/max_bytes）を config 可能に
+- [ ] `since_event_seq` が retention の外に落ちた場合の扱い:
+  - [ ] エラー（OUT_OF_RANGE） or “最古seqから再開” を仕様化
+- [ ] 負荷テスト（大量ログ + 遅い購読者）
+
+**DoD**
+- メモリ上限が設定で制御できる
+- 遅い購読者で他が巻き込まれない
+
+**Acceptance Criteria**
+- 大量ログ発生時でも corkd が OOM しない（少なくともCIで再現可能な規模で確認）
+
+**Docs**
+- docs/specification.md に retention/backpressure の仕様を追記
+
+
+---
+
+## [ ] CORE-150: 入力サイズ制限・クォータ（巨大JSON/巨大patchで落ちない）
+**Priority:** P0  
+**Type:** Security / Stability  
+**Depends on:** CORE-103
+
+**Goal**
+- 悪意/事故（巨大な contract/policy/patch/log）で corkd が落ちない
+
+**Scope**
+- gRPC max message size（受信/送信）の設定
+- contract/policy/patch の max bytes / max nodes / max edges / max ops
+- 1 stage あたりの max patch count（別タスク CORE-111 と連携）
+
+**Subtasks**
+- [ ] サーバ設定で gRPC message size 上限を設定（デフォルトを安全側に）
+- [ ] SubmitRun: contract/policy の最大サイズ・最大ステージ数制限
+- [ ] ApplyGraphPatch: ops数/ノード数/エッジ数制限
+- [ ] reject reason を体系化（CORE-043 に寄せる）
+- [ ] テスト（境界値: 上限-1/上限/上限+1）
+
+**DoD**
+- “巨大入力でプロセスが落ちない” がテストで担保される
+
+**Acceptance Criteria**
+- 上限超過時は必ず reject され、Run状態やストアが壊れない
+
+
+---
+
+# P1: 運用耐性（長時間実行 / 失敗が日常の環境）
+
+## [ ] CORE-111: watchdog（TTL / idle / patch嵐 / 無限ループ検知）
+**Priority:** P1  
+**Type:** Availability  
+**Depends on:** CORE-112（推奨：ログ過多対策と相性）
+
+**Goal**
+- Run が永遠にぶら下がる/patch が無限に投げられる状況を Core が自律的に収束させる
+
+**Scope**
+- run_ttl / idle_ttl
+- max_total_patch_count / max_patch_count_per_stage
+- 進捗（progress）の定義: node state change / stage commit / patch applied 等
+
+**Subtasks**
+- [ ] policy に watchdog 設定を追加（後方互換: optional）
+- [ ] Supervisor tick で watchdog 判定
+- [ ] 閾値超えで CancelRun 相当を発火（reason付き）
+- [ ] テスト:
+  - [ ] idle_ttl 超過で cancel
+  - [ ] patch嵐で cancel
+  - [ ] stage open too long（max_open_ms）と整合
+
+**DoD**
+- “止まらないRun” が時間/回数で必ず止まる
+
+**Acceptance Criteria**
+- 指定TTLを越える Run が残り続けない
+
+
+---
+
+## [ ] CORE-113: Worker呼び出しの resilience（timeout / retry / backoff / circuit breaker）
+**Priority:** P1  
+**Type:** Reliability  
+**Depends on:** CORE-101
+
+**Goal**
+- Workerが不安定でも CorkCore が固まらず、再試行 or 明確な失敗で収束する
+
+**Scope**
+- per-node timeout（grpc-timeout）
+- retry（指数バックオフ + jitter）
+- circuit breaker（一定時間 fail-fast）
+
+**Subtasks**
+- [ ] エラー分類（retryable / non-retryable）を導入
+- [ ] retry policy を policy 側から設定可能に（デフォルトも用意）
+- [ ] circuit breaker 状態を run event として出す（可観測に）
+- [ ] 統合テスト:
+  - [ ] Workerが一時的に落ちる → retryで回復
+  - [ ] 永続失敗 → 最終的にFAILED
+
+**DoD**
+- 失敗時の state 遷移が一貫し、理由がログに残る
+
+**Acceptance Criteria**
+- Worker障害で corkd がハングしない
+
+
+---
+
+## [ ] CORE-141: graceful shutdown（drain / flush / consistency）
+**Priority:** P1  
+**Type:** Ops readiness  
+**Depends on:** CORE-103, CORE-112
+
+**Goal**
+- SIGTERM 等で落とすときに、状態/ログが中途半端にならない
+
+**Scope**
+- サーバ停止時:
+  - 新規リクエスト停止
+  - 進行中 run の扱い（cancel or drain）を設定可能に
+  - event/log flush（永続化がある場合は必須）
+
+**Subtasks**
+- [ ] shutdown signal を受けて gRPC server を drain
+- [ ] Supervisor に cancel/drain コマンド送付
+- [ ] “停止時ポリシー” を設定で切替
+- [ ] テスト: 停止→再起動後に run が整合した状態で見える
+
+**DoD**
+- “落とし方” が決まり、運用で事故らない
+
+**Acceptance Criteria**
+- shutdown でデータ不整合が起きない（少なくともE2Eで確認）
+
+
+---
+
+## [ ] CORE-110: 永続ストア（SQLite等）/ 再起動復元（実験管理の実体化）
+**Priority:** P1  
+**Type:** Durability  
+**Depends on:** CORE-103, CORE-141
+
+**Goal**
+- corkd 再起動で Run/Graph/Patch/Event/Logs が復元される
+
+**Scope（段階導入）**
+- Phase 1: RunRegistry + PatchStore + EventLog（最低限の復元）
+- Phase 2: GraphStore + StateStore + LogStore
+
+**Subtasks**
+- [ ] Store trait の境界を再点検（永続化しやすい責務に）
+- [ ] SQLite 実装（feature flag）を追加
+- [ ] migration（schema_version）導入
+- [ ] 統合テスト:
+  - [ ] 起動→SubmitRun→Patch→停止→再起動→GetCompositeGraph一致
+  - [ ] event_seq / patch_seq の連続性の扱いを仕様化（再起動で連続維持 or 再計算）
+
+**DoD**
+- “再起動しても再現できる” が動く
+
+**Acceptance Criteria**
+- 再起動後に、Runの履歴と composite graph が一致する
+
+
+---
+
+# P1: 観測性 / 利用可能性
+
+## [ ] CORE-120: structured tracing + metrics（run_id/scope_id/patch_seq を相関IDに）
+**Priority:** P1  
+**Type:** Observability  
+**Depends on:** CORE-101
+
+**Goal**
+- 並列実行のデバッグを “ログ/メトリクスで” 可能にする（運用で詰まらない）
+
+**Scope**
+- tracing span に run_id/stage_id/node_id/scope_id/patch_seq を必ず付与
+- Prometheus などのメトリクス（req latency / queue depth / running nodes / worker errors）
+
+**Subtasks**
+- [ ] gRPC interceptor で request_id を付与
+- [ ] 主要APIハンドラに span を張る
+- [ ] metrics exporter を追加（feature flagでも可）
+- [ ] “観測項目一覧” を docs に固定
+
+**DoD**
+- “どのRunの何が遅い/失敗した” が観測可能
+
+**Acceptance Criteria**
+- run_id だけで関連ログ/イベントが追える
+
+
+---
+
+# P2: 将来の最適化（Job-shop / SHOP3）に向けた下地
+
+## [ ] CORE-130: Graphの制約メタデータ拡張（Job-shop / HTN 将来対応のための保存層）
+**Priority:** P2  
+**Type:** Future-proofing  
+**Depends on:** CORE-103
+
+**Goal**
+- 後で CP-SAT / Job-shop / SHOP3 に繋げられるデータ項目を“壊さず”保持する
+
+**Scope**
+- Node/Edge に optional メタデータ追加（schedulerが未利用でもOK）
+  - resource_profile（cpu/io/mem/gpu の相対コスト）
+  - exclusive_key（mutex group）
+  - release_time / deadline / due_date
+  - estimated_duration_ms
+  - preemptible（将来）
+- canonicalization/hashing への影響を仕様化（prenorm対象の決定）
+
+**Subtasks**
+- [ ] schema を更新（後方互換）
+- [ ] cork-canon の prenorm に追加ルール（必要なら）
+- [ ] GetCompositeGraph で欠損なく返す
+- [ ] unit test: hash stability（順序の違いが同値扱いになる箇所の固定）
+
+**DoD**
+- “将来の最適化” のために、今のGraphが捨て情報にならない
+
+**Acceptance Criteria**
+- メタデータ付きpatchが受理・保持・取得できる
+
+
+---
+
+# P2: テスト強化（壊れないことの担保）
+
+## [ ] CORE-143: Spec conformance test suite（仕様準拠を自動で証明）
+**Priority:** P2  
+**Type:** Quality  
+**Depends on:** CORE-100, CORE-103
+
+**Goal**
+- 実装が進んでも spec から逸脱しない（回帰しない）
+
+**Scope**
+- 仕様の“重要不変条件”をテストにする:
+  - patch_seq 厳密連番
+  - event_seq 単調増加（Run内）
+  - reject時に状態不変（原子性）
+  - side_effect の idempotency_key 必須
+  - JSON pointer / value ref の境界
+
+**Subtasks**
+- [ ] spec の不変条件を列挙してテスト一覧化
+- [ ] E2E + unit に配分して実装
+- [ ] 破壊的変更が必要な場合は ADR 化
+
+**DoD**
+- 仕様逸脱が CI で止まる
+
+**Acceptance Criteria**
+- PRで spec を壊すと必ずテストが落ちる
+
+
+---
+
+## [ ] CORE-152: fuzz / property tests（Patch/JSON入力の堅牢性）
+**Priority:** P2  
+**Type:** Security / Robustness  
+**Depends on:** CORE-150
+
+**Goal**
+- 変なJSON/境界値入力で panic / OOM / deadlock しない
+
+**Scope**
+- `apply_patch(validate)` の fuzz
+- JSON pointer / ref 解決の fuzz
+- 可能なら proptest で “原子性” を性質として固定
+
+**Subtasks**
+- [ ] fuzz target（cargo-fuzz）追加
+- [ ] proptest で patch ops をランダム生成し、reject時不変性をチェック
+- [ ] CIで短時間 fuzz を回す（nightly job でも可）
+
+**DoD**
+- “入力が悪くても落ちない” の確率を上げる
+
+**Acceptance Criteria**
+- 最低限の fuzz ランが CI で回り、panic を検知できる
