@@ -472,9 +472,9 @@ async fn e2e_submit_patch_execute_commit() {
     let graph_store = service.graph_store();
     let now = SystemTime::now();
     let past = now.checked_sub(Duration::from_millis(10)).expect("past");
-    let run_ctx = registry.get_run(&run_id).expect("run ctx");
-    run_ctx.set_stage_started_at(Some(past));
-    run_ctx.set_last_patch_at(Some(past));
+    let run_ctx = registry.get_run(&run_id).await.expect("run ctx");
+    run_ctx.set_stage_started_at(Some(past)).await;
+    run_ctx.set_last_patch_at(Some(past)).await;
     let result = tick_stage_auto_commit(
         &run_ctx,
         &contract,
@@ -483,13 +483,14 @@ async fn e2e_submit_patch_execute_commit() {
         graph_store.as_ref(),
         event_log.as_ref(),
         now,
-    );
+    )
+    .await;
     assert!(result.is_some(), "stage1 auto-commit should fire");
 
     let now2 = SystemTime::now();
     let past2 = now2.checked_sub(Duration::from_millis(10)).expect("past2");
-    run_ctx.set_stage_started_at(Some(past2));
-    run_ctx.set_last_patch_at(Some(past2));
+    run_ctx.set_stage_started_at(Some(past2)).await;
+    run_ctx.set_last_patch_at(Some(past2)).await;
     let result = tick_stage_auto_commit(
         &run_ctx,
         &contract,
@@ -498,10 +499,11 @@ async fn e2e_submit_patch_execute_commit() {
         graph_store.as_ref(),
         event_log.as_ref(),
         now2,
-    );
+    )
+    .await;
     assert!(result.is_some(), "stage2 auto-commit should fire");
 
-    run_ctx.set_status(RunStatus::RunSucceeded);
+    run_ctx.set_status(RunStatus::RunSucceeded).await;
 
     let stream_response = service
         .stream_run_events(Request::new(StreamRunEventsRequest {
@@ -583,9 +585,9 @@ async fn e2e_submit_patch_execute_commit() {
         .bytes32;
     assert_eq!(composite_hash, composite_digest.to_vec());
 
-    let run_ctx = registry.get_run(&run_id).expect("run ctx");
-    assert_eq!(run_ctx.metadata().status, RunStatus::RunSucceeded);
-    assert_eq!(run_ctx.next_patch_seq(), 1);
+    let run_ctx = registry.get_run(&run_id).await.expect("run ctx");
+    assert_eq!(run_ctx.metadata().await.status, RunStatus::RunSucceeded);
+    assert_eq!(run_ctx.next_patch_seq().await, 1);
 }
 
 #[tokio::test]

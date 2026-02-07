@@ -150,16 +150,16 @@ impl PatchTracker {
         &self.patch_hashes
     }
 
-    pub fn apply_patch(&mut self, run_ctx: &RunCtx, patch_bytes: &[u8]) -> HashBundle {
+    pub async fn apply_patch(&mut self, run_ctx: &RunCtx, patch_bytes: &[u8]) -> HashBundle {
         let digest = patch_hash(patch_bytes);
         self.patch_hashes.push(digest);
-        run_ctx.advance_patch_seq();
-        self.update_hash_bundle(run_ctx)
+        run_ctx.advance_patch_seq().await;
+        self.update_hash_bundle(run_ctx).await
     }
 
-    fn update_hash_bundle(&self, run_ctx: &RunCtx) -> HashBundle {
+    async fn update_hash_bundle(&self, run_ctx: &RunCtx) -> HashBundle {
         let composite = composite_graph_hash(&self.contract_hash, &self.patch_hashes);
-        let existing = run_ctx.metadata().hash_bundle;
+        let existing = run_ctx.metadata().await.hash_bundle;
         let (policy_hash, run_config_hash) = existing
             .as_ref()
             .map(|bundle| (bundle.policy_hash.clone(), bundle.run_config_hash.clone()))
@@ -170,7 +170,7 @@ impl PatchTracker {
             run_config_hash,
             composite_graph_hash: Some(bytes_to_sha256(&composite)),
         };
-        run_ctx.set_hash_bundle(Some(bundle.clone()));
+        run_ctx.set_hash_bundle(Some(bundle.clone())).await;
         bundle
     }
 }
@@ -363,15 +363,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_patch_updates_hash_bundle() {
+    #[tokio::test]
+    async fn apply_patch_updates_hash_bundle() {
         let registry = InMemoryRunRegistry::new();
-        let run_ctx = registry.create_run(CreateRunInput::default());
+        let run_ctx = registry.create_run(CreateRunInput::default()).await;
         let contract_digest = contract_hash(b"contract");
         let mut tracker = PatchTracker::new(contract_digest);
 
-        let bundle = tracker.apply_patch(&run_ctx, br#"{"op":"noop"}"#);
-        let stored = run_ctx.metadata().hash_bundle.expect("hash bundle");
+        let bundle = tracker.apply_patch(&run_ctx, br#"{"op":"noop"}"#).await;
+        let stored = run_ctx.metadata().await.hash_bundle.expect("hash bundle");
 
         assert_eq!(
             stored
@@ -395,18 +395,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn composite_graph_hash_tracks_patch_sequence() {
+    #[tokio::test]
+    async fn composite_graph_hash_tracks_patch_sequence() {
         let registry = InMemoryRunRegistry::new();
-        let run_ctx = registry.create_run(CreateRunInput::default());
+        let run_ctx = registry.create_run(CreateRunInput::default()).await;
         let contract_digest = contract_hash(b"contract");
         let mut tracker = PatchTracker::new(contract_digest);
 
-        tracker.apply_patch(&run_ctx, br#"{"op":"first"}"#);
-        tracker.apply_patch(&run_ctx, br#"{"op":"second"}"#);
+        tracker.apply_patch(&run_ctx, br#"{"op":"first"}"#).await;
+        tracker.apply_patch(&run_ctx, br#"{"op":"second"}"#).await;
 
         let expected = composite_graph_hash(&contract_digest, tracker.patch_hashes());
-        let stored = run_ctx.metadata().hash_bundle.expect("hash bundle");
+        let stored = run_ctx.metadata().await.hash_bundle.expect("hash bundle");
         let stored_composite = stored
             .composite_graph_hash
             .as_ref()
@@ -417,17 +417,20 @@ mod tests {
         assert_eq!(stored_composite, expected.to_vec());
     }
 
-    #[test]
-    fn rejects_patch_seq_gap() {
+    #[tokio::test]
+    async fn rejects_patch_seq_gap() {
         let registry = InMemoryRunRegistry::new();
-        let run_ctx = registry.create_run(CreateRunInput {
-            next_patch_seq: Some(1),
-            ..Default::default()
-        });
+        let run_ctx = registry
+            .create_run(CreateRunInput {
+                next_patch_seq: Some(1),
+                ..Default::default()
+            })
+            .await;
 
         let result =
             run_ctx
                 .check_patch_seq(0)
+                .await
                 .map_err(|expected| PatchRejectReason::PatchSeqGap {
                     expected,
                     provided: 0,

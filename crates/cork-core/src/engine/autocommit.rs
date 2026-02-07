@@ -49,7 +49,7 @@ impl StageAutoCommitSupervisor {
     }
 }
 
-pub fn tick_stage_auto_commit(
+pub async fn tick_stage_auto_commit(
     run_ctx: &Arc<RunCtx>,
     contract: &ValidatedContractManifest,
     node_states: &HashMap<String, NodeRuntimeState>,
@@ -58,17 +58,17 @@ pub fn tick_stage_auto_commit(
     event_log: &dyn EventLog,
     now: SystemTime,
 ) -> Option<AutoCommitResult> {
-    let policy = run_ctx.stage_auto_commit()?;
+    let policy = run_ctx.stage_auto_commit().await?;
     if !policy.enabled {
         return None;
     }
-    let active_stage_id = run_ctx.active_stage_id()?;
+    let active_stage_id = run_ctx.active_stage_id().await?;
     let stage_state = stage_states.get(&active_stage_id)?;
     if stage_state.status != StageRuntimeStatus::Active {
         return None;
     }
-    let stage_started_at = ensure_stage_started(run_ctx, now);
-    let last_patch_at = ensure_last_patch_at(run_ctx, stage_started_at);
+    let stage_started_at = ensure_stage_started(run_ctx, now).await;
+    let last_patch_at = ensure_last_patch_at(run_ctx, stage_started_at).await;
     let max_open_exceeded =
         elapsed(now, stage_started_at) > Duration::from_millis(policy.max_open_ms);
     let quiescent = elapsed(now, last_patch_at) >= Duration::from_millis(policy.quiescence_ms);
@@ -96,22 +96,23 @@ pub fn tick_stage_auto_commit(
         &active_stage_id,
         reason.clone(),
     )
+    .await
 }
 
-fn ensure_stage_started(run_ctx: &RunCtx, now: SystemTime) -> SystemTime {
-    if let Some(started_at) = run_ctx.stage_started_at() {
+async fn ensure_stage_started(run_ctx: &RunCtx, now: SystemTime) -> SystemTime {
+    if let Some(started_at) = run_ctx.stage_started_at().await {
         started_at
     } else {
-        run_ctx.set_stage_started_at(Some(now));
+        run_ctx.set_stage_started_at(Some(now)).await;
         now
     }
 }
 
-fn ensure_last_patch_at(run_ctx: &RunCtx, stage_started_at: SystemTime) -> SystemTime {
-    if let Some(last_patch_at) = run_ctx.last_patch_at() {
+async fn ensure_last_patch_at(run_ctx: &RunCtx, stage_started_at: SystemTime) -> SystemTime {
+    if let Some(last_patch_at) = run_ctx.last_patch_at().await {
         last_patch_at
     } else {
-        run_ctx.set_last_patch_at(Some(stage_started_at));
+        run_ctx.set_last_patch_at(Some(stage_started_at)).await;
         stage_started_at
     }
 }
@@ -172,7 +173,7 @@ fn is_terminal(status: &NodeRuntimeStatus) -> bool {
     )
 }
 
-fn apply_commit_transition(
+async fn apply_commit_transition(
     run_ctx: &Arc<RunCtx>,
     contract: &ValidatedContractManifest,
     stage_states: &mut HashMap<String, StageRuntimeState>,
@@ -199,12 +200,14 @@ fn apply_commit_transition(
                 status: StageRuntimeStatus::Active,
             },
         );
-        run_ctx.set_active_stage(
-            Some(next_stage.to_string()),
-            run_ctx.active_stage_expansion_policy(),
-        );
+        run_ctx
+            .set_active_stage(
+                Some(next_stage.to_string()),
+                run_ctx.active_stage_expansion_policy().await,
+            )
+            .await;
     } else {
-        run_ctx.set_active_stage(None, None);
+        run_ctx.set_active_stage(None, None).await;
     }
     let event = RunEvent {
         event_seq: 0,
@@ -216,7 +219,7 @@ fn apply_commit_transition(
             reason: reason.as_str().to_string(),
         })),
     };
-    event_log.append(event);
+    event_log.append(event).await;
     Some(AutoCommitResult {
         committed_stage_id: active_stage_id.to_string(),
         next_stage_id,
@@ -256,21 +259,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn auto_commit_advances_stage_on_quiescence() {
+    #[tokio::test]
+    async fn auto_commit_advances_stage_on_quiescence() {
         let registry = InMemoryRunRegistry::new();
-        let run = registry.create_run(CreateRunInput {
-            stage_auto_commit: Some(StageAutoCommitPolicy {
-                enabled: true,
-                quiescence_ms: 10,
-                max_open_ms: 1000,
-                exclude_when_waiting: false,
-            }),
-            active_stage_id: Some("stage-a".to_string()),
-            ..Default::default()
-        });
-        run.set_stage_started_at(Some(SystemTime::now() - Duration::from_millis(50)));
-        run.set_last_patch_at(Some(SystemTime::now() - Duration::from_millis(20)));
+        let run = registry
+            .create_run(CreateRunInput {
+                stage_auto_commit: Some(StageAutoCommitPolicy {
+                    enabled: true,
+                    quiescence_ms: 10,
+                    max_open_ms: 1000,
+                    exclude_when_waiting: false,
+                }),
+                active_stage_id: Some("stage-a".to_string()),
+                ..Default::default()
+            })
+            .await;
+        run.set_stage_started_at(Some(SystemTime::now() - Duration::from_millis(50)))
+            .await;
+        run.set_last_patch_at(Some(SystemTime::now() - Duration::from_millis(20)))
+            .await;
         let graph_store = InMemoryGraphStore::new();
         graph_store
             .add_node(run.run_id(), build_node("stage-a/node-a", "PRE", "tool"))
@@ -302,11 +309,12 @@ mod tests {
             &event_log,
             SystemTime::now(),
         )
+        .await
         .expect("commit should occur");
 
         assert_eq!(result.committed_stage_id, "stage-a");
         assert_eq!(result.next_stage_id.as_deref(), Some("stage-b"));
-        assert_eq!(run.active_stage_id().as_deref(), Some("stage-b"));
+        assert_eq!(run.active_stage_id().await.as_deref(), Some("stage-b"));
         assert_eq!(
             stage_states.get("stage-a").expect("stage-a state").status,
             StageRuntimeStatus::Committed
@@ -315,7 +323,7 @@ mod tests {
             stage_states.get("stage-b").expect("stage-b state").status,
             StageRuntimeStatus::Active
         );
-        let events = event_log.subscribe(0).backlog;
+        let events = event_log.subscribe(0).await.backlog;
         assert_eq!(events.len(), 1);
         match events[0].event.as_ref().expect("event") {
             run_event::Event::Stage(stage_event) => {
@@ -326,21 +334,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn auto_commit_forces_on_max_open() {
+    #[tokio::test]
+    async fn auto_commit_forces_on_max_open() {
         let registry = InMemoryRunRegistry::new();
-        let run = registry.create_run(CreateRunInput {
-            stage_auto_commit: Some(StageAutoCommitPolicy {
-                enabled: true,
-                quiescence_ms: 1000,
-                max_open_ms: 5,
-                exclude_when_waiting: false,
-            }),
-            active_stage_id: Some("stage-a".to_string()),
-            ..Default::default()
-        });
-        run.set_stage_started_at(Some(SystemTime::now() - Duration::from_millis(20)));
-        run.set_last_patch_at(Some(SystemTime::now()));
+        let run = registry
+            .create_run(CreateRunInput {
+                stage_auto_commit: Some(StageAutoCommitPolicy {
+                    enabled: true,
+                    quiescence_ms: 1000,
+                    max_open_ms: 5,
+                    exclude_when_waiting: false,
+                }),
+                active_stage_id: Some("stage-a".to_string()),
+                ..Default::default()
+            })
+            .await;
+        run.set_stage_started_at(Some(SystemTime::now() - Duration::from_millis(20)))
+            .await;
+        run.set_last_patch_at(Some(SystemTime::now())).await;
         let graph_store = InMemoryGraphStore::new();
         graph_store
             .add_node(run.run_id(), build_node("stage-a/node-a", "WITHIN", "tool"))
@@ -372,27 +383,32 @@ mod tests {
             &event_log,
             SystemTime::now(),
         )
+        .await
         .expect("commit should occur");
 
         assert_eq!(result.reason, AutoCommitReason::MaxOpen);
-        assert_eq!(run.active_stage_id(), None);
+        assert_eq!(run.active_stage_id().await, None);
     }
 
-    #[test]
-    fn auto_commit_respects_exclude_when_waiting() {
+    #[tokio::test]
+    async fn auto_commit_respects_exclude_when_waiting() {
         let registry = InMemoryRunRegistry::new();
-        let run = registry.create_run(CreateRunInput {
-            stage_auto_commit: Some(StageAutoCommitPolicy {
-                enabled: true,
-                quiescence_ms: 10,
-                max_open_ms: 1000,
-                exclude_when_waiting: true,
-            }),
-            active_stage_id: Some("stage-a".to_string()),
-            ..Default::default()
-        });
-        run.set_stage_started_at(Some(SystemTime::now() - Duration::from_millis(50)));
-        run.set_last_patch_at(Some(SystemTime::now() - Duration::from_millis(20)));
+        let run = registry
+            .create_run(CreateRunInput {
+                stage_auto_commit: Some(StageAutoCommitPolicy {
+                    enabled: true,
+                    quiescence_ms: 10,
+                    max_open_ms: 1000,
+                    exclude_when_waiting: true,
+                }),
+                active_stage_id: Some("stage-a".to_string()),
+                ..Default::default()
+            })
+            .await;
+        run.set_stage_started_at(Some(SystemTime::now() - Duration::from_millis(50)))
+            .await;
+        run.set_last_patch_at(Some(SystemTime::now() - Duration::from_millis(20)))
+            .await;
         let graph_store = InMemoryGraphStore::new();
         graph_store
             .add_node(
@@ -426,13 +442,14 @@ mod tests {
             &graph_store,
             &event_log,
             SystemTime::now(),
-        );
+        )
+        .await;
 
         assert!(result.is_none());
         assert_eq!(
             stage_states.get("stage-a").expect("stage-a state").status,
             StageRuntimeStatus::Active
         );
-        assert!(event_log.subscribe(0).backlog.is_empty());
+        assert!(event_log.subscribe(0).await.backlog.is_empty());
     }
 }
