@@ -584,6 +584,15 @@ impl CorkCore for CorkCoreService {
                 },
             )));
         }
+        let patch_store_expected = self.patch_store.patches_in_order(run_ctx.run_id()).len() as u64;
+        if patch_store_expected != metadata.patch_seq {
+            return Ok(Response::new(reject_response(
+                GraphPatchRejectionReason::PatchSeqMismatch {
+                    expected: patch_store_expected,
+                    provided: metadata.patch_seq,
+                },
+            )));
+        }
         let stage_touch = match parse_stage_touch(&patch, &metadata.stage_id) {
             Ok(stage_touch) => stage_touch,
             Err(reason) => return Ok(Response::new(reject_response(reason))),
@@ -1015,6 +1024,37 @@ mod tests {
             "unexpected rejection reason: {}",
             response.rejection_reason
         );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_patch_store_mismatch() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 1);
+        let patch =
+            build_patch_document(&handle.run_id, 1, "stage-a", json!([node_added_op("LLM")]));
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle.clone()),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("patch_seq mismatch"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
+        assert!(
+            service
+                .patch_store
+                .patches_in_order(&handle.run_id)
+                .is_empty()
+        );
+        assert!(service.graph_store.node(&handle.run_id, "node-1").is_none());
     }
 
     #[tokio::test]

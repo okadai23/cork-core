@@ -997,6 +997,8 @@ CORE-021, CORE-026
   - 変更ファイル: `crates/cork-core/src/api/core_service.rs`。
 - [DONE] PatchStore/GetCompositeGraphのユニットテストを追加。
   - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`。
+- [DONE] PatchStoreの不整合時にApplyGraphPatchを拒否するガードとテストを追加。
+  - 変更ファイル: `crates/cork-core/src/api/core_service.rs`。
 - 検証: `pre-commit run --all-files`, `make fmt`, `make lint`, `make test`。
 
 ---
