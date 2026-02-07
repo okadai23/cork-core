@@ -31,7 +31,11 @@
     "tlsv",
     "traceparent",
     "tracestate",
-    "VecDeque"
+    "VecDeque",
+    "backpressure",
+    "integ",
+    "preemptible",
+    "proptest"
   ],
   "ignorePaths": [
     "**/target/**",

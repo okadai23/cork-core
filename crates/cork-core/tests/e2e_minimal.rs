@@ -187,6 +187,35 @@ fn build_contract_manifest() -> Value {
     })
 }
 
+fn build_contract_manifest_defaults_only() -> Value {
+    json!({
+        "schema_version": "cork.contract_manifest.v0.1",
+        "manifest_id": "manifest-002",
+        "defaults": {
+            "expansion_policy": {
+                "allow_dynamic": true,
+                "allow_kinds": ["TOOL"],
+                "max_dynamic_nodes": 2,
+                "max_steps_in_stage": 2,
+                "allow_cross_stage_deps": "NONE"
+            },
+            "stage_budget": {},
+            "stage_ttl": {},
+            "completion_policy": {
+                "fail_on_any_failure": false,
+                "require_commit": true
+            }
+        },
+        "contract_graph": {
+            "stages": [
+                {
+                    "stage_id": "stage1"
+                }
+            ]
+        }
+    })
+}
+
 fn build_policy() -> Value {
     json!({
         "schema_version": "cork.policy.v0.1",
@@ -557,4 +586,49 @@ async fn e2e_submit_patch_execute_commit() {
     let run_ctx = registry.get_run(&run_id).expect("run ctx");
     assert_eq!(run_ctx.metadata().status, RunStatus::RunSucceeded);
     assert_eq!(run_ctx.next_patch_seq(), 1);
+}
+
+#[tokio::test]
+async fn e2e_minimal_defaults_expansion_policy() {
+    let registry: Arc<dyn RunRegistry> = Arc::new(InMemoryRunRegistry::new());
+    let service = CorkCoreService::with_run_registry(Arc::clone(&registry));
+
+    let contract_json = build_contract_manifest_defaults_only();
+    let policy_json = build_policy();
+    let contract_doc = canonical_doc(contract_json, "cork.contract_manifest.v0.1");
+    let policy_doc = canonical_doc(policy_json, "cork.policy.v0.1");
+
+    let submit_request = SubmitRunRequest {
+        contract_manifest: Some(contract_doc),
+        policy: Some(policy_doc),
+        initial_input: Some(Payload {
+            content_type: "application/json".to_string(),
+            data: br#"{}"#.to_vec(),
+            encoding: "".to_string(),
+            sha256: None,
+        }),
+        experiment_id: "exp-2".to_string(),
+        variant_id: "var-2".to_string(),
+        trace_context: None,
+    };
+    let submit_response = service
+        .submit_run(Request::new(submit_request))
+        .await
+        .expect("submit run")
+        .into_inner();
+    let handle = submit_response.handle.expect("handle");
+    let run_id = handle.run_id.clone();
+
+    let patch_doc = build_patch(&run_id, 0, "stage1");
+    let patch_request = ApplyGraphPatchRequest {
+        handle: Some(handle),
+        patch: Some(patch_doc),
+        actor_id: "actor-1".to_string(),
+    };
+    let patch_response = service
+        .apply_graph_patch(Request::new(patch_request))
+        .await
+        .expect("apply patch")
+        .into_inner();
+    assert!(patch_response.accepted);
 }
