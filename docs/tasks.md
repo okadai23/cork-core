@@ -1024,9 +1024,9 @@ CORE-024〜026
 
 ### サブタスク
 
-- [ ] `enum PatchRejectReason { PatchSeqGap, StageNotActive, KindNotAllowed, IdempotencyRequired, InvalidJsonPointer, UnknownNodeId, CycleDetected, ... }`
-- [ ] `impl Display` でUI向けの短い文言を生成
-- [ ] rejection_reasonに格納
+- [x] `enum PatchRejectReason { PatchSeqGap, StageNotActive, KindNotAllowed, IdempotencyRequired, InvalidJsonPointer, UnknownNodeId, CycleDetected, ... }`
+- [x] `impl Display` でUI向けの短い文言を生成
+- [x] rejection_reasonに格納
 
 ### DoD
 
@@ -1034,8 +1034,14 @@ CORE-024〜026
 
 ### Acceptance Criteria
 
-- [ ] 代表的拒否ケースで rejection_reason が期待通り
-- [ ] UIが rejection_reason をそのまま表示して理解できる文面
+- [x] 代表的拒否ケースで rejection_reason が期待通り
+- [x] UIが rejection_reason をそのまま表示して理解できる文面
+
+### 進捗
+
+- [DONE] ApplyGraphPatch の拒否理由 enum と表示文言を追加し、主要な拒否ケースのテストを拡充。
+  - 変更ファイル: `crates/cork-core/src/engine/patch.rs`, `crates/cork-core/src/api/core_service.rs`, `docs/tasks.md`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
