@@ -778,12 +778,12 @@ CORE-032, CORE-033
 
 ### サブタスク
 
-- [ ] READY集合の収集
-- [ ] tie_break実装:
+- [x] READY集合の収集
+- [x] tie_break実装:
   - FIFO（node_idの安定順）
   - PRIORITY（scheduling.priority）
   - SHORTEST / LONGEST（estimated_duration_ms）
-- [ ] 起動手順:
+- [x] 起動手順:
   - ResourceManagerで予約
   - scope_id生成 + scope_seq採番（Log/RunEventに反映）
   - NodeStateChanged（READY→RUNNING）をemit
@@ -800,8 +800,14 @@ CORE-032, CORE-033
 ### Acceptance Criteria
 
 - [ ] READYノードが存在すれば実行が進む
-- [ ] tie_breakを変更すると起動順が変わる（テストで検証）
-- [ ] NodeStateChanged が event_seq順で流れる
+- [x] tie_breakを変更すると起動順が変わる（テストで検証）
+- [x] NodeStateChanged が event_seq順で流れる
+
+### 進捗
+
+- [DONE] LISTスケジューラのREADY集合収集とtie_breakソートを追加し、起動フローでResource予約・scope採番・READY→RUNNINGイベント発行・Worker呼び出しを連結。
+  - 変更ファイル: `crates/cork-core/src/scheduler/list.rs`, `crates/cork-core/src/scheduler/mod.rs`, `crates/cork-core/src/engine/run.rs`, `crates/cork-core/Cargo.toml`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 

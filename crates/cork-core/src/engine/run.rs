@@ -2,15 +2,24 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cork_proto::cork::v1::{GetRunResponse, RunHandle, RunStatus};
+use base64::Engine as _;
+use base64::engine::general_purpose;
+use cork_proto::cork::v1::run_event;
+use cork_proto::cork::v1::{
+    GetRunResponse, InvokeToolRequest, LogRecord, NodeStateChanged, NodeStatus, Payload, RunEvent,
+    RunHandle, RunStatus, TraceContext,
+};
 use cork_store::{
-    ArtifactRef, NodeOutput, NodePayload, NodeSpec, RunCtx, RunRegistry, StageAutoCommitPolicy,
-    StateStore,
+    ArtifactRef, EventLog, LogStore, NodeOutput, NodePayload, NodeSpec, RunCtx, RunRegistry,
+    StageAutoCommitPolicy, StateStore,
 };
 use prost_types::Timestamp;
 use serde_json::Value;
 
 use super::refs::{RenderAs, ValueRef, ValueRefType, resolve_value_ref};
+use crate::scheduler::list::SchedulingProfile;
+use crate::scheduler::resource::{ResourceManager, ResourceManagerError};
+use crate::worker::client::{InvocationBudget, InvocationContext, WorkerClient};
 
 pub fn run_ctx_to_response(run_ctx: &Arc<RunCtx>) -> GetRunResponse {
     let metadata = run_ctx.metadata();
@@ -79,6 +88,14 @@ pub enum SchedulerMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerTieBreak {
+    Fifo,
+    Priority,
+    ShortestEstimatedFirst,
+    LongestEstimatedFirst,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourcePoolKind {
     Cumulative,
     Exclusive,
@@ -96,6 +113,7 @@ pub struct ResourcePoolSpec {
 pub struct ValidatedPolicy {
     pub resource_pools: Vec<ResourcePoolSpec>,
     pub scheduler_mode: SchedulerMode,
+    pub scheduler_tie_break: SchedulerTieBreak,
     pub stage_auto_commit: StageAutoCommitPolicy,
 }
 
@@ -119,10 +137,12 @@ pub fn validate_policy(value: &Value) -> Result<ValidatedPolicy, PolicyError> {
     cork_schema::validate_policy(value).map_err(|err| PolicyError::Schema(format!("{err:?}")))?;
     let resource_pools = parse_resource_pools(value)?;
     let scheduler_mode = parse_scheduler_mode(value)?;
+    let scheduler_tie_break = parse_scheduler_tie_break(value)?;
     let stage_auto_commit = parse_stage_auto_commit(value)?;
     Ok(ValidatedPolicy {
         resource_pools,
         scheduler_mode,
+        scheduler_tie_break,
         stage_auto_commit,
     })
 }
@@ -568,6 +588,23 @@ fn parse_scheduler_mode(value: &Value) -> Result<SchedulerMode, PolicyError> {
     }
 }
 
+fn parse_scheduler_tie_break(value: &Value) -> Result<SchedulerTieBreak, PolicyError> {
+    let tie_break = value
+        .get("scheduler")
+        .and_then(|scheduler| scheduler.get("tie_break"))
+        .and_then(|tie_break| tie_break.as_str())
+        .ok_or_else(|| PolicyError::Schema("scheduler.tie_break is missing".to_string()))?;
+    match tie_break {
+        "FIFO" => Ok(SchedulerTieBreak::Fifo),
+        "PRIORITY" => Ok(SchedulerTieBreak::Priority),
+        "SHORTEST_ESTIMATED_FIRST" => Ok(SchedulerTieBreak::ShortestEstimatedFirst),
+        "LONGEST_ESTIMATED_FIRST" => Ok(SchedulerTieBreak::LongestEstimatedFirst),
+        other => Err(PolicyError::Schema(format!(
+            "unknown scheduler.tie_break {other}"
+        ))),
+    }
+}
+
 fn parse_stage_auto_commit(value: &Value) -> Result<StageAutoCommitPolicy, PolicyError> {
     let auto_commit = value
         .get("stage_auto_commit")
@@ -603,11 +640,239 @@ fn parse_stage_auto_commit(value: &Value) -> Result<StageAutoCommitPolicy, Polic
     })
 }
 
+#[derive(Debug)]
+pub enum StartNodeError {
+    MissingStageId,
+    InvalidExec(String),
+    ResourceManager(ResourceManagerError),
+}
+
+pub struct StartNodeContext<'a> {
+    pub run_id: &'a str,
+    pub node: &'a NodeSpec,
+    pub node_states: &'a mut HashMap<String, NodeRuntimeState>,
+    pub resource_manager: &'a ResourceManager,
+    pub event_log: &'a dyn EventLog,
+    pub log_store: &'a dyn LogStore,
+    pub state_store: &'a dyn StateStore,
+    pub worker: &'a mut WorkerClient,
+    pub budget: InvocationBudget,
+    pub trace_context: Option<TraceContext>,
+}
+
+pub async fn start_ready_node(
+    context: StartNodeContext<'_>,
+) -> Result<Option<NodeRuntimeStatus>, StartNodeError> {
+    let StartNodeContext {
+        run_id,
+        node,
+        node_states,
+        resource_manager,
+        event_log,
+        log_store,
+        state_store,
+        worker,
+        budget,
+        trace_context,
+    } = context;
+    let current = node_states
+        .get(&node.node_id)
+        .cloned()
+        .unwrap_or(NodeRuntimeState {
+            status: NodeRuntimeStatus::Pending,
+            last_error: None,
+        });
+    if current.status != NodeRuntimeStatus::Ready {
+        return Ok(None);
+    }
+
+    let scheduling = SchedulingProfile::from_node(node);
+    let reservation = resource_manager
+        .try_reserve(
+            &scheduling.resource_requests,
+            &scheduling.resource_alternatives,
+        )
+        .map_err(StartNodeError::ResourceManager)?;
+    let Some(_reservation) = reservation else {
+        return Ok(None);
+    };
+
+    let stage_id = node_stage_id(&node.node_id).ok_or(StartNodeError::MissingStageId)?;
+    let start_log = LogRecord {
+        ts: Some(now_timestamp()),
+        level: "INFO".to_string(),
+        message: "node_start".to_string(),
+        trace_id_hex: "".to_string(),
+        span_id_hex: "".to_string(),
+        scope_id: "".to_string(),
+        scope_seq: 0,
+        attrs: Default::default(),
+    };
+    let start_log = log_store.append_log(run_id, stage_id, &node.node_id, start_log);
+    event_log.append(RunEvent {
+        event_seq: 0,
+        ts: start_log.ts,
+        event: Some(run_event::Event::Log(start_log)),
+    });
+
+    append_node_state(
+        event_log,
+        stage_id,
+        &node.node_id,
+        NodeStatus::NodeReady,
+        NodeStatus::NodeRunning,
+        None,
+    );
+    node_states.insert(
+        node.node_id.clone(),
+        NodeRuntimeState {
+            status: NodeRuntimeStatus::Running,
+            last_error: None,
+        },
+    );
+
+    let invocation = InvocationContext {
+        run_id,
+        stage_id,
+        node_id: &node.node_id,
+        event_log,
+        log_store,
+        state_store,
+        budget,
+        trace_context,
+    };
+    let request = build_tool_request(run_id, node)?;
+    let result = match worker.invoke_tool_stream(request, &invocation).await {
+        Ok(_) => NodeRuntimeState {
+            status: NodeRuntimeStatus::Succeeded,
+            last_error: None,
+        },
+        Err(status) => NodeRuntimeState {
+            status: NodeRuntimeStatus::Failed,
+            last_error: Some(format!("gRPC {:?}: {}", status.code(), status.message())),
+        },
+    };
+    node_states.insert(node.node_id.clone(), result.clone());
+    Ok(Some(result.status))
+}
+
+fn build_tool_request(run_id: &str, node: &NodeSpec) -> Result<InvokeToolRequest, StartNodeError> {
+    let tool = node
+        .exec
+        .get("tool")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| StartNodeError::InvalidExec("exec.tool is missing".to_string()))?;
+    let tool_name = tool
+        .get("tool_name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| StartNodeError::InvalidExec("tool_name is missing".to_string()))?;
+    let tool_version = tool
+        .get("tool_version")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| StartNodeError::InvalidExec("tool_version is missing".to_string()))?;
+    let idempotency_key = tool
+        .get("idempotency_key")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let input = parse_tool_input(tool.get("input"))?;
+    let invocation_id = format!(
+        "{run_id}:{}:{}",
+        node.node_id,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    );
+    Ok(InvokeToolRequest {
+        invocation_id,
+        tool_name: tool_name.to_string(),
+        tool_version: tool_version.to_string(),
+        input,
+        deadline: None,
+        idempotency_key,
+        trace_context: None,
+    })
+}
+
+fn parse_tool_input(value: Option<&Value>) -> Result<Option<Payload>, StartNodeError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Some(literal) = value.get("literal").and_then(|value| value.as_object()) {
+        let content_type = literal
+            .get("content_type")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                StartNodeError::InvalidExec("literal.content_type is missing".to_string())
+            })?;
+        let data_base64 = literal
+            .get("data_base64")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                StartNodeError::InvalidExec("literal.data_base64 is missing".to_string())
+            })?;
+        let data = general_purpose::STANDARD
+            .decode(data_base64.as_bytes())
+            .map_err(|err| StartNodeError::InvalidExec(format!("base64 error: {err}")))?;
+        return Ok(Some(Payload {
+            content_type: content_type.to_string(),
+            data,
+            encoding: "".to_string(),
+            sha256: None,
+        }));
+    }
+    let data = serde_json::to_vec(value)
+        .map_err(|err| StartNodeError::InvalidExec(format!("input json error: {err}")))?;
+    Ok(Some(Payload {
+        content_type: "application/json".to_string(),
+        data,
+        encoding: "".to_string(),
+        sha256: None,
+    }))
+}
+
+fn append_node_state(
+    event_log: &dyn EventLog,
+    stage_id: &str,
+    node_id: &str,
+    old_status: NodeStatus,
+    new_status: NodeStatus,
+    reason: Option<String>,
+) {
+    let event = RunEvent {
+        event_seq: 0,
+        ts: Some(now_timestamp()),
+        event: Some(run_event::Event::NodeState(NodeStateChanged {
+            stage_id: stage_id.to_string(),
+            node_id: node_id.to_string(),
+            old_status: old_status as i32,
+            new_status: new_status as i32,
+            reason: reason.unwrap_or_default(),
+        })),
+    };
+    event_log.append(event);
+}
+
+fn now_timestamp() -> Timestamp {
+    system_time_to_timestamp(SystemTime::now())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::resource::{ConcurrencyLimits, ResourceManager};
+    use crate::worker::client::WorkerClient;
+    use cork_proto::cork::v1::cork_worker_server::{CorkWorker, CorkWorkerServer};
+    use cork_proto::cork::v1::{InvokeToolRequest, InvokeToolResponse, InvokeToolStreamChunk};
     use cork_store::{CreateRunInput, InMemoryRunRegistry, InMemoryStateStore, RunFilters};
+    use cork_store::{InMemoryEventLog, InMemoryLogStore};
     use serde_json::json;
+    use std::pin::Pin;
+    use tokio::net::TcpListener;
+    use tokio_stream::Stream;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status};
 
     #[test]
     fn run_ctx_to_response_maps_fields() {
@@ -1161,6 +1426,7 @@ mod tests {
         let policy = build_policy();
         let validated = validate_policy(&policy).expect("valid policy");
         assert_eq!(validated.scheduler_mode, SchedulerMode::ListHeuristic);
+        assert_eq!(validated.scheduler_tie_break, SchedulerTieBreak::Fifo);
         assert_eq!(
             validated.stage_auto_commit,
             StageAutoCommitPolicy {
@@ -1212,5 +1478,164 @@ mod tests {
             result,
             Err(PolicyError::UnsupportedSchedulerMode(mode)) if mode == "OPTIMIZE_CP_SAT"
         ));
+    }
+
+    struct TestWorker;
+
+    #[tonic::async_trait]
+    impl CorkWorker for TestWorker {
+        async fn health(
+            &self,
+            _request: Request<cork_proto::cork::v1::HealthRequest>,
+        ) -> Result<Response<cork_proto::cork::v1::HealthResponse>, Status> {
+            Ok(Response::new(cork_proto::cork::v1::HealthResponse {
+                status: "ok".to_string(),
+                worker_id: "worker-1".to_string(),
+            }))
+        }
+
+        async fn invoke_tool(
+            &self,
+            _request: Request<InvokeToolRequest>,
+        ) -> Result<Response<InvokeToolResponse>, Status> {
+            Ok(Response::new(InvokeToolResponse {
+                output: Some(Payload {
+                    content_type: "text/plain".to_string(),
+                    data: b"ok".to_vec(),
+                    encoding: "".to_string(),
+                    sha256: None,
+                }),
+                artifacts: Vec::new(),
+                error_code: "".to_string(),
+                error_message: "".to_string(),
+            }))
+        }
+
+        type InvokeToolStreamStream =
+            Pin<Box<dyn Stream<Item = Result<InvokeToolStreamChunk, Status>> + Send>>;
+
+        async fn invoke_tool_stream(
+            &self,
+            _request: Request<InvokeToolRequest>,
+        ) -> Result<Response<Self::InvokeToolStreamStream>, Status> {
+            let response = InvokeToolResponse {
+                output: Some(Payload {
+                    content_type: "text/plain".to_string(),
+                    data: b"ok".to_vec(),
+                    encoding: "".to_string(),
+                    sha256: None,
+                }),
+                artifacts: Vec::new(),
+                error_code: "".to_string(),
+                error_message: "".to_string(),
+            };
+            let chunks = vec![Ok(InvokeToolStreamChunk {
+                ts: None,
+                chunk: Some(cork_proto::cork::v1::invoke_tool_stream_chunk::Chunk::Final(response)),
+            })];
+            Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+        }
+    }
+
+    async fn start_test_worker() -> (tonic::transport::Channel, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let incoming = TcpListenerStream::new(listener);
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(CorkWorkerServer::new(TestWorker))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .expect("channel")
+            .connect()
+            .await
+            .expect("connect");
+        (channel, handle)
+    }
+
+    #[tokio::test]
+    async fn start_ready_node_emits_state_events_in_order() {
+        let (channel, handle) = start_test_worker().await;
+        let mut worker = WorkerClient::new(channel);
+        let event_log = InMemoryEventLog::new();
+        let log_store = InMemoryLogStore::new();
+        let state_store = InMemoryStateStore::new();
+        let resource_manager = ResourceManager::new(
+            ConcurrencyLimits {
+                cpu_max: 1,
+                io_max: 1,
+                per_provider_max: 1,
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("resource manager");
+
+        let node = NodeSpec {
+            node_id: "stage-a/node-a".to_string(),
+            kind: "TOOL".to_string(),
+            anchor_position: "WITHIN".to_string(),
+            exec: json!({
+                "tool": {
+                    "tool_name": "tool-a",
+                    "tool_version": "v1",
+                    "side_effect": "NONE",
+                    "input": { "literal": { "content_type": "application/json", "data_base64": "e30=" } }
+                }
+            }),
+            deps: Vec::new(),
+            scheduling: Some(json!({
+                "resources": [{ "resource_id": "cpu", "amount": 1 }]
+            })),
+            htn: None,
+            ttl_ms: None,
+        };
+        let mut node_states = HashMap::new();
+        node_states.insert(
+            node.node_id.clone(),
+            NodeRuntimeState {
+                status: NodeRuntimeStatus::Ready,
+                last_error: None,
+            },
+        );
+
+        let result = start_ready_node(StartNodeContext {
+            run_id: "run-1",
+            node: &node,
+            node_states: &mut node_states,
+            resource_manager: &resource_manager,
+            event_log: &event_log,
+            log_store: &log_store,
+            state_store: &state_store,
+            worker: &mut worker,
+            budget: InvocationBudget::default(),
+            trace_context: None,
+        })
+        .await
+        .expect("start");
+        assert_eq!(result, Some(NodeRuntimeStatus::Succeeded));
+        assert_eq!(
+            node_states.get(&node.node_id).expect("state").status,
+            NodeRuntimeStatus::Succeeded
+        );
+
+        let events = event_log.subscribe(0).backlog;
+        let node_events: Vec<NodeStateChanged> = events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                Some(run_event::Event::NodeState(node_state)) => Some(node_state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(node_events.len(), 2);
+        assert_eq!(node_events[0].old_status, NodeStatus::NodeReady as i32);
+        assert_eq!(node_events[0].new_status, NodeStatus::NodeRunning as i32);
+        assert_eq!(node_events[1].old_status, NodeStatus::NodeRunning as i32);
+        assert_eq!(node_events[1].new_status, NodeStatus::NodeSucceeded as i32);
+
+        handle.abort();
     }
 }

@@ -14,6 +14,7 @@ cork-proto = { workspace = true }
 cork-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

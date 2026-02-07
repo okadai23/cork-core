@@ -223,6 +223,7 @@ dependencies = [
 name = "cork-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cork-hash",
  "cork-proto",
  "cork-schema",
