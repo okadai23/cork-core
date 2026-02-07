@@ -282,6 +282,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_json_output_without_text_render() {
+        let store = InMemoryStateStore::new();
+        let output = NodeOutput::from_payload(
+            NodePayload {
+                content_type: "text/plain".to_string(),
+                data: b"hello".to_vec(),
+            },
+            Vec::new(),
+        );
+        store.set_node_output("run-1", "node-1", output);
+
+        let value_ref = ValueRef {
+            run_id: "run-1".to_string(),
+            ref_type: ValueRefType::NodeOutput,
+            json_pointer: "".to_string(),
+            stage_id: None,
+            node_id: Some("node-1".to_string()),
+            artifact_index: None,
+            render_as: None,
+        };
+        let result = resolve_value_ref(&value_ref, &store);
+        assert!(matches!(result, Err(ValueRefError::NotJsonOutput(_))));
+    }
+
+    #[test]
     fn resolves_node_artifact() {
         let store = InMemoryStateStore::new();
         let output = NodeOutput::from_payload(

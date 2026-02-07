@@ -107,7 +107,7 @@ enum Sha256Verification {
 }
 
 #[derive(Debug)]
-struct GraphPatchMetadata {
+pub(crate) struct GraphPatchMetadata {
     patch_seq: u64,
     stage_id: String,
     node_kinds: Vec<String>,
@@ -217,7 +217,7 @@ fn verify_canonical_sha256(doc: &CanonicalJsonDocument) -> Result<Sha256Verifica
     }
 }
 
-fn parse_graph_patch_metadata(
+pub(crate) fn parse_graph_patch_metadata(
     patch: &CanonicalJsonDocument,
 ) -> Result<GraphPatchMetadata, PatchRejectReason> {
     let value: Value = serde_json::from_slice(&patch.canonical_json_utf8).map_err(|err| {

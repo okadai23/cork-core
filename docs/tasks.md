@@ -1074,11 +1074,11 @@ CORE-020, CORE-024, CORE-030
 
 ### サブタスク
 
-- [ ] JCS同値性テスト（フィールド順、deps順）
+- [x] JCS同値性テスト（フィールド順、deps順）
   - RFC 8785が"hashable representation"を意図していることを根拠に採用
-- [ ] patch_seq厳密連番テスト
-- [ ] side_effect idempotency強制テスト
-- [ ] JSON Pointer参照テスト（RFC 6901）
+- [x] patch_seq厳密連番テスト
+- [x] side_effect idempotency強制テスト
+- [x] JSON Pointer参照テスト（RFC 6901）
 
 ### DoD
 
@@ -1086,7 +1086,13 @@ CORE-020, CORE-024, CORE-030
 
 ### Acceptance Criteria
 
-- [ ] `cargo test` で上記すべてが通る
+- [x] `cargo test` で上記すべてが通る
+
+### 進捗
+
+- [DONE] patch_seq/side_effect/参照式の拒否条件テストを追加して仕様固定を完了。
+  - 変更: `crates/cork-core/src/engine/patch.rs`, `crates/cork-core/src/engine/refs.rs` にテスト追加。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 
