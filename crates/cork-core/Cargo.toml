@@ -7,7 +7,12 @@ version.workspace = true
 name = "corkd"
 path = "src/main.rs"
 
+[[bin]]
+name = "corkctl"
+path = "src/bin/corkctl.rs"
+
 [dependencies]
+cork-canon = { workspace = true }
 cork-hash = { workspace = true }
 cork-schema = { workspace = true }
 cork-proto = { workspace = true }
@@ -19,3 +24,8 @@ tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 prost-types = { workspace = true }
+clap = { version = "4.5.23", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.14"
+tempfile = "3.10.1"
