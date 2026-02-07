@@ -337,8 +337,31 @@ fn parse_node_spec(node: &Value) -> Result<NodeSpec, GraphPatchApplyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::core_service::parse_graph_patch_metadata;
     use cork_hash::contract_hash;
+    use cork_proto::cork::v1::CanonicalJsonDocument;
     use cork_store::{CreateRunInput, InMemoryRunRegistry, RunRegistry};
+    use serde_json::json;
+
+    fn build_patch_document(
+        run_id: &str,
+        patch_seq: u64,
+        stage_id: &str,
+        ops: serde_json::Value,
+    ) -> CanonicalJsonDocument {
+        let payload = json!({
+            "schema_version": "cork.graph_patch.v0.1",
+            "run_id": run_id,
+            "patch_seq": patch_seq,
+            "stage_id": stage_id,
+            "ops": ops,
+        });
+        CanonicalJsonDocument {
+            canonical_json_utf8: serde_json::to_vec(&payload).expect("serialize patch document"),
+            sha256: None,
+            schema_id: "cork.graph_patch.v0.1".to_string(),
+        }
+    }
 
     #[test]
     fn apply_patch_updates_hash_bundle() {
@@ -392,5 +415,69 @@ mod tests {
             .clone();
 
         assert_eq!(stored_composite, expected.to_vec());
+    }
+
+    #[test]
+    fn rejects_patch_seq_gap() {
+        let registry = InMemoryRunRegistry::new();
+        let run_ctx = registry.create_run(CreateRunInput {
+            next_patch_seq: Some(1),
+            ..Default::default()
+        });
+
+        let result =
+            run_ctx
+                .check_patch_seq(0)
+                .map_err(|expected| PatchRejectReason::PatchSeqGap {
+                    expected,
+                    provided: 0,
+                });
+
+        assert_eq!(
+            result,
+            Err(PatchRejectReason::PatchSeqGap {
+                expected: 1,
+                provided: 0
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_side_effect_without_idempotency_key() {
+        let patch = build_patch_document(
+            "run-1",
+            0,
+            "stage-a",
+            json!([{
+                "op_type": "NODE_ADDED",
+                "node_added": {
+                    "node": {
+                        "node_id": "node-tool-1",
+                        "kind": "TOOL",
+                        "anchor_position": "WITHIN",
+                        "deps": [],
+                        "exec": {
+                            "tool": {
+                                "tool_name": "tool-a",
+                                "tool_version": "v1",
+                                "input": {
+                                    "literal": {
+                                        "content_type": "application/json",
+                                        "data_base64": "e30="
+                                    }
+                                },
+                                "side_effect": "EXTERNAL_WRITE"
+                            }
+                        }
+                    }
+                }
+            }]),
+        );
+
+        let result = parse_graph_patch_metadata(&patch);
+        assert!(matches!(
+            result,
+            Err(PatchRejectReason::IdempotencyRequired)
+        ));
     }
 }
