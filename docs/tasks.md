@@ -16,7 +16,7 @@
 
 | マイルストーン | 概要 | タスク |
 | --- | --- | --- |
-| M0 | Skeleton（ビルド・proto・サーバ起動） | CORE-001, CORE-002 |
+| M0 | Skeleton（ビルド・proto・サーバ起動） | CORE-001, CORE-002, CORE-003 |
 | M1 | Run作成とイベント配信（UI一次情報源の成立） | CORE-010, CORE-011, CORE-012 |
 | M2 | GraphPatch適用と検証（連番・idempotency・参照式） | CORE-020〜CORE-026 |
 | M3 | スケジューラとState/Ref解決（READY判定→Tool起動→状態遷移） | CORE-030〜CORE-035 |
@@ -117,6 +117,45 @@ CORE-001
 - [ ] 生成物がリポジトリにコミットされない運用（build時生成）or 生成物コミット運用、どちらかに統一
 
 ---
+
+## CORE-003: CLI インターフェース（ローカル操作）
+
+### 内容
+
+- `corkctl` CLI で Core を操作できるようにする
+- SubmitRun / ApplyGraphPatch / StreamRunEvents / GetRun を実行可能にする
+- JSON 入力を canonicalize して送信する
+
+### 依存
+
+CORE-002
+
+### 触るファイル
+
+- `crates/cork-core/src/cli.rs`
+- `crates/cork-core/src/bin/corkctl.rs`
+- `crates/cork-core/Cargo.toml`
+
+### サブタスク
+
+- [x] CLI コマンド構成（serve/submit-run/apply-patch/stream-events/get-run）
+- [x] 入力 JSON の canonicalize と sha256 付与
+- [x] ユニットテストで CLI パースと canonicalize を検証
+
+### DoD
+
+- CLI から SubmitRun/ApplyGraphPatch/StreamRunEvents/GetRun が呼べる
+
+### Acceptance Criteria
+
+- [x] `corkctl submit-run` で run_id を取得できる
+- [x] `corkctl stream-events` でイベントを購読できる
+
+### 進捗
+
+- [DONE] CLI モジュールと `corkctl` バイナリを追加し、canonicalize と sha256 付与を実装。
+  - 変更ファイル: `crates/cork-core/src/cli.rs`, `crates/cork-core/src/bin/corkctl.rs`, `crates/cork-core/Cargo.toml`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 # M1: Run作成とイベント配信（UI一次情報源の成立）
 

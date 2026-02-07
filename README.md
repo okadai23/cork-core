@@ -54,3 +54,44 @@ cargo run -p cork-core --bin corkd
 ```
 
 デフォルトで `[::1]:50051` でgRPCサーバが起動します。
+
+## CLI（corkctl）
+
+`corkctl` から Core の gRPC API を呼び出して動作確認できます。JSON入力は
+JCS canonicalize と SHA-256 付与を行ったうえで送信します。
+
+### 起動
+
+```bash
+cargo run -p cork-core --bin corkctl -- serve --addr 127.0.0.1:50051
+```
+
+### SubmitRun
+
+```bash
+cargo run -p cork-core --bin corkctl -- submit-run \
+  --contract ./contract.json \
+  --policy ./policy.json \
+  --input ./input.json \
+  --input-content-type application/json
+```
+
+### ApplyGraphPatch
+
+```bash
+cargo run -p cork-core --bin corkctl -- apply-patch \
+  --run-id <RUN_ID> \
+  --patch ./patch.json
+```
+
+### StreamRunEvents
+
+```bash
+cargo run -p cork-core --bin corkctl -- stream-events --run-id <RUN_ID>
+```
+
+### GetRun
+
+```bash
+cargo run -p cork-core --bin corkctl -- get-run --run-id <RUN_ID>
+```
