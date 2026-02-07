@@ -21,8 +21,8 @@ use crate::scheduler::list::SchedulingProfile;
 use crate::scheduler::resource::{ResourceManager, ResourceManagerError};
 use crate::worker::client::{InvocationBudget, InvocationContext, WorkerClient};
 
-pub fn run_ctx_to_response(run_ctx: &Arc<RunCtx>) -> GetRunResponse {
-    let metadata = run_ctx.metadata();
+pub async fn run_ctx_to_response(run_ctx: &Arc<RunCtx>) -> GetRunResponse {
+    let metadata = run_ctx.metadata().await;
     GetRunResponse {
         handle: Some(RunHandle {
             run_id: run_ctx.run_id().to_string(),
@@ -35,9 +35,9 @@ pub fn run_ctx_to_response(run_ctx: &Arc<RunCtx>) -> GetRunResponse {
     }
 }
 
-pub fn get_run_response(registry: &dyn RunRegistry, run_id: &str) -> Option<GetRunResponse> {
-    let run_ctx = registry.get_run(run_id)?;
-    Some(run_ctx_to_response(&run_ctx))
+pub async fn get_run_response(registry: &dyn RunRegistry, run_id: &str) -> Option<GetRunResponse> {
+    let run_ctx = registry.get_run(run_id).await?;
+    Some(run_ctx_to_response(&run_ctx).await)
 }
 
 fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
@@ -709,11 +709,13 @@ pub async fn start_ready_node(
         attrs: Default::default(),
     };
     let start_log = log_store.append_log(run_id, stage_id, &node.node_id, start_log);
-    event_log.append(RunEvent {
-        event_seq: 0,
-        ts: start_log.ts,
-        event: Some(run_event::Event::Log(start_log)),
-    });
+    event_log
+        .append(RunEvent {
+            event_seq: 0,
+            ts: start_log.ts,
+            event: Some(run_event::Event::Log(start_log)),
+        })
+        .await;
 
     append_node_state(
         event_log,
@@ -722,7 +724,8 @@ pub async fn start_ready_node(
         NodeStatus::NodeReady,
         NodeStatus::NodeRunning,
         None,
-    );
+    )
+    .await;
     node_states.insert(
         node.node_id.clone(),
         NodeRuntimeState {
@@ -832,7 +835,7 @@ fn parse_tool_input(value: Option<&Value>) -> Result<Option<Payload>, StartNodeE
     }))
 }
 
-fn append_node_state(
+async fn append_node_state(
     event_log: &dyn EventLog,
     stage_id: &str,
     node_id: &str,
@@ -851,7 +854,7 @@ fn append_node_state(
             reason: reason.unwrap_or_default(),
         })),
     };
-    event_log.append(event);
+    event_log.append(event).await;
 }
 
 fn now_timestamp() -> Timestamp {
@@ -874,27 +877,29 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
 
-    #[test]
-    fn run_ctx_to_response_maps_fields() {
+    #[tokio::test]
+    async fn run_ctx_to_response_maps_fields() {
         let registry = InMemoryRunRegistry::new();
-        let run = registry.create_run(CreateRunInput {
-            experiment_id: Some("exp".to_string()),
-            variant_id: Some("var".to_string()),
-            status: Some(RunStatus::RunRunning),
-            ..Default::default()
-        });
+        let run = registry
+            .create_run(CreateRunInput {
+                experiment_id: Some("exp".to_string()),
+                variant_id: Some("var".to_string()),
+                status: Some(RunStatus::RunRunning),
+                ..Default::default()
+            })
+            .await;
 
-        let response = run_ctx_to_response(&run);
+        let response = run_ctx_to_response(&run).await;
         assert_eq!(response.handle.unwrap().run_id, run.run_id());
         assert_eq!(response.status, RunStatus::RunRunning as i32);
         assert!(response.created_at.is_some());
         assert!(response.updated_at.is_some());
     }
 
-    #[test]
-    fn get_run_response_returns_none_when_missing() {
+    #[tokio::test]
+    async fn get_run_response_returns_none_when_missing() {
         let registry = InMemoryRunRegistry::new();
-        assert!(get_run_response(&registry, "missing").is_none());
+        assert!(get_run_response(&registry, "missing").await.is_none());
     }
 
     #[test]
@@ -926,32 +931,38 @@ mod tests {
         assert_eq!(stored, output);
     }
 
-    #[test]
-    fn list_runs_filters_in_registry() {
+    #[tokio::test]
+    async fn list_runs_filters_in_registry() {
         let registry = InMemoryRunRegistry::new();
-        registry.create_run(CreateRunInput {
-            experiment_id: Some("exp-1".to_string()),
-            status: Some(RunStatus::RunPending),
-            ..Default::default()
-        });
-        registry.create_run(CreateRunInput {
-            experiment_id: Some("exp-2".to_string()),
-            status: Some(RunStatus::RunPending),
-            ..Default::default()
-        });
-
-        let page = registry.list_runs(
-            None,
-            RunFilters {
+        registry
+            .create_run(CreateRunInput {
                 experiment_id: Some("exp-1".to_string()),
-                variant_id: None,
                 status: Some(RunStatus::RunPending),
-            },
-            10,
-        );
+                ..Default::default()
+            })
+            .await;
+        registry
+            .create_run(CreateRunInput {
+                experiment_id: Some("exp-2".to_string()),
+                status: Some(RunStatus::RunPending),
+                ..Default::default()
+            })
+            .await;
+
+        let page = registry
+            .list_runs(
+                None,
+                RunFilters {
+                    experiment_id: Some("exp-1".to_string()),
+                    variant_id: None,
+                    status: Some(RunStatus::RunPending),
+                },
+                10,
+            )
+            .await;
         assert_eq!(page.runs.len(), 1);
         assert_eq!(
-            page.runs[0].metadata().experiment_id.as_deref(),
+            page.runs[0].metadata().await.experiment_id.as_deref(),
             Some("exp-1")
         );
     }
@@ -1622,7 +1633,7 @@ mod tests {
             NodeRuntimeStatus::Succeeded
         );
 
-        let events = event_log.subscribe(0).backlog;
+        let events = event_log.subscribe(0).await.backlog;
         let node_events: Vec<NodeStateChanged> = events
             .into_iter()
             .filter_map(|event| match event.event {

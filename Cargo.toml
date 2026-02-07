@@ -31,6 +31,8 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 jsonschema = "0.40.2"
+dashmap = "5.5.3"
+async-trait = "0.1.89"
 
 # internal crates
 cork-proto = { path = "crates/cork-proto" }

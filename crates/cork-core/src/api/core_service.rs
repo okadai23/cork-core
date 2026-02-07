@@ -3,8 +3,7 @@
 //! This module contains the implementation of the CorkCore gRPC service
 //! as defined in `proto/cork/v1/core.proto`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::patch::{PatchRejectReason, apply_graph_patch_ops};
@@ -23,6 +22,7 @@ use cork_store::{
     InMemoryPatchStore, InMemoryRunRegistry, InMemoryStateStore, LogFilters, LogStore, PatchStore,
     RunCtx, RunRegistry,
 };
+use dashmap::DashMap;
 use prost_types::Timestamp;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -33,7 +33,7 @@ use tonic::{Request, Response, Status};
 
 /// The CorkCore service implementation.
 pub struct CorkCoreService {
-    event_logs: Arc<RwLock<HashMap<String, Arc<InMemoryEventLog>>>>,
+    event_logs: DashMap<String, Arc<InMemoryEventLog>>,
     graph_store: Arc<InMemoryGraphStore>,
     log_store: Arc<InMemoryLogStore>,
     patch_store: Arc<InMemoryPatchStore>,
@@ -49,7 +49,7 @@ impl CorkCoreService {
 
     pub fn with_run_registry(run_registry: Arc<dyn RunRegistry>) -> Self {
         Self {
-            event_logs: Arc::new(RwLock::new(HashMap::new())),
+            event_logs: DashMap::new(),
             graph_store: Arc::new(InMemoryGraphStore::new()),
             log_store: Arc::new(InMemoryLogStore::new()),
             patch_store: Arc::new(InMemoryPatchStore::new()),
@@ -58,18 +58,16 @@ impl CorkCoreService {
         }
     }
 
-    pub fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx> {
-        self.run_registry.create_run(input)
+    pub async fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx> {
+        self.run_registry.create_run(input).await
     }
 
     pub fn event_log_for_run(&self, run_id: &str) -> Arc<InMemoryEventLog> {
-        let mut logs = self
+        let entry = self
             .event_logs
-            .write()
-            .expect("event log store lock poisoned");
-        logs.entry(run_id.to_string())
-            .or_insert_with(|| Arc::new(InMemoryEventLog::new()))
-            .clone()
+            .entry(run_id.to_string())
+            .or_insert_with(|| Arc::new(InMemoryEventLog::new()));
+        Arc::clone(&*entry)
     }
 
     pub fn graph_store(&self) -> Arc<InMemoryGraphStore> {
@@ -88,7 +86,7 @@ impl CorkCoreService {
 impl Default for CorkCoreService {
     fn default() -> Self {
         Self {
-            event_logs: Arc::new(RwLock::new(HashMap::new())),
+            event_logs: DashMap::new(),
             graph_store: Arc::new(InMemoryGraphStore::new()),
             log_store: Arc::new(InMemoryLogStore::new()),
             patch_store: Arc::new(InMemoryPatchStore::new()),
@@ -495,26 +493,29 @@ impl CorkCore for CorkCoreService {
             composite_graph_hash: None,
         };
         let now = SystemTime::now();
-        let run_ctx = self.run_registry.create_run(CreateRunInput {
-            experiment_id: if request.experiment_id.is_empty() {
-                None
-            } else {
-                Some(request.experiment_id)
-            },
-            variant_id: if request.variant_id.is_empty() {
-                None
-            } else {
-                Some(request.variant_id)
-            },
-            status: Some(RunStatus::RunRunning),
-            hash_bundle: Some(hash_bundle.clone()),
-            stage_auto_commit: Some(validated_policy.stage_auto_commit),
-            next_patch_seq: Some(0),
-            active_stage_id: Some(active_stage_id.to_string()),
-            active_stage_expansion_policy: Some(expansion_policy),
-            stage_started_at: Some(now),
-            last_patch_at: Some(now),
-        });
+        let run_ctx = self
+            .run_registry
+            .create_run(CreateRunInput {
+                experiment_id: if request.experiment_id.is_empty() {
+                    None
+                } else {
+                    Some(request.experiment_id)
+                },
+                variant_id: if request.variant_id.is_empty() {
+                    None
+                } else {
+                    Some(request.variant_id)
+                },
+                status: Some(RunStatus::RunRunning),
+                hash_bundle: Some(hash_bundle.clone()),
+                stage_auto_commit: Some(validated_policy.stage_auto_commit),
+                next_patch_seq: Some(0),
+                active_stage_id: Some(active_stage_id.to_string()),
+                active_stage_expansion_policy: Some(expansion_policy),
+                stage_started_at: Some(now),
+                last_patch_at: Some(now),
+            })
+            .await;
         self.patch_store
             .set_contract_manifest(run_ctx.run_id(), contract);
         Ok(Response::new(SubmitRunResponse {
@@ -522,7 +523,9 @@ impl CorkCore for CorkCoreService {
                 run_id: run_ctx.run_id().to_string(),
             }),
             hashes: Some(hash_bundle),
-            created_at: Some(system_time_to_timestamp(run_ctx.metadata().created_at)),
+            created_at: Some(system_time_to_timestamp(
+                run_ctx.metadata().await.created_at,
+            )),
         }))
     }
 
@@ -567,7 +570,7 @@ impl CorkCore for CorkCoreService {
         }
         let since_seq = request.since_event_seq as u64;
         let log = self.event_log_for_run(&handle.run_id);
-        let subscription = log.subscribe(since_seq);
+        let subscription = log.subscribe(since_seq).await;
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
@@ -612,6 +615,7 @@ impl CorkCore for CorkCoreService {
         let run_ctx = self
             .run_registry
             .get_run(&handle.run_id)
+            .await
             .ok_or_else(|| Status::not_found("run not found"))?;
         let patch = request
             .patch
@@ -628,15 +632,15 @@ impl CorkCore for CorkCoreService {
             Ok(metadata) => metadata,
             Err(reason) => return Ok(Response::new(reject_response(reason))),
         };
-        if run_ctx.active_stage_id().as_deref() != Some(&metadata.stage_id) {
+        if run_ctx.active_stage_id().await.as_deref() != Some(&metadata.stage_id) {
             return Ok(Response::new(reject_response(
                 PatchRejectReason::StageNotActive {
-                    active_stage_id: run_ctx.active_stage_id(),
+                    active_stage_id: run_ctx.active_stage_id().await,
                     provided_stage_id: metadata.stage_id,
                 },
             )));
         }
-        let Some(expansion_policy) = run_ctx.active_stage_expansion_policy() else {
+        let Some(expansion_policy) = run_ctx.active_stage_expansion_policy().await else {
             return Ok(Response::new(reject_response(
                 PatchRejectReason::ExpansionPolicyMissing,
             )));
@@ -659,7 +663,7 @@ impl CorkCore for CorkCoreService {
                 }
             }
         }
-        if let Err(expected) = run_ctx.check_patch_seq(metadata.patch_seq) {
+        if let Err(expected) = run_ctx.check_patch_seq(metadata.patch_seq).await {
             return Ok(Response::new(reject_response(
                 PatchRejectReason::PatchSeqGap {
                     expected,
@@ -689,16 +693,16 @@ impl CorkCore for CorkCoreService {
                 },
             )));
         }
-        run_ctx.advance_patch_seq();
+        run_ctx.advance_patch_seq().await;
         if stage_touch.touches_active_stage {
-            run_ctx.touch_stage_patch();
+            run_ctx.touch_stage_patch().await;
         }
         let event = RunEvent {
             event_seq: 0,
             ts: Some(system_time_to_timestamp(SystemTime::now())),
             event: Some(run_event::Event::GraphPatch(patch.clone())),
         };
-        self.event_log_for_run(run_ctx.run_id()).append(event);
+        self.event_log_for_run(run_ctx.run_id()).append(event).await;
         Ok(Response::new(ApplyGraphPatchResponse {
             accepted: true,
             rejection_reason: String::new(),
@@ -719,6 +723,7 @@ impl CorkCore for CorkCoreService {
         let run_ctx = self
             .run_registry
             .get_run(&handle.run_id)
+            .await
             .ok_or_else(|| Status::not_found("run not found"))?;
         let contract = self
             .patch_store
@@ -731,7 +736,7 @@ impl CorkCore for CorkCoreService {
             .map(|patch| patch_hash(&patch.canonical_json_utf8))
             .collect();
         let composite = composite_graph_hash(&contract_digest, &patch_hashes);
-        let existing = run_ctx.metadata().hash_bundle;
+        let existing = run_ctx.metadata().await.hash_bundle;
         let (policy_hash, run_config_hash) = existing
             .as_ref()
             .map(|bundle| (bundle.policy_hash.clone(), bundle.run_config_hash.clone()))
@@ -1029,7 +1034,7 @@ mod tests {
         })
     }
 
-    fn setup_service_with_run(
+    async fn setup_service_with_run(
         active_stage_id: &str,
         allow_dynamic: bool,
         allow_kinds: Vec<&str>,
@@ -1037,15 +1042,17 @@ mod tests {
     ) -> (CorkCoreService, RunHandle) {
         let registry: Arc<dyn RunRegistry> = Arc::new(InMemoryRunRegistry::new());
         let service = CorkCoreService::with_run_registry(Arc::clone(&registry));
-        let run = registry.create_run(CreateRunInput {
-            active_stage_id: Some(active_stage_id.to_string()),
-            active_stage_expansion_policy: Some(ExpansionPolicy {
-                allow_dynamic,
-                allow_kinds: allow_kinds.into_iter().map(str::to_string).collect(),
-            }),
-            next_patch_seq: Some(next_patch_seq),
-            ..Default::default()
-        });
+        let run = registry
+            .create_run(CreateRunInput {
+                active_stage_id: Some(active_stage_id.to_string()),
+                active_stage_expansion_policy: Some(ExpansionPolicy {
+                    allow_dynamic,
+                    allow_kinds: allow_kinds.into_iter().map(str::to_string).collect(),
+                }),
+                next_patch_seq: Some(next_patch_seq),
+                ..Default::default()
+            })
+            .await;
         (
             service,
             RunHandle {
@@ -1059,7 +1066,7 @@ mod tests {
         let service = CorkCoreService::new();
         let run_id = "run-1";
         let log = service.event_log_for_run(run_id);
-        log.append(RunEvent::default());
+        log.append(RunEvent::default()).await;
 
         let request = StreamRunEventsRequest {
             handle: Some(RunHandle {
@@ -1080,7 +1087,7 @@ mod tests {
             .expect("stream event");
         assert_eq!(first.event_seq, 0);
 
-        log.append(RunEvent::default());
+        log.append(RunEvent::default()).await;
         let second = stream
             .next()
             .await
@@ -1090,8 +1097,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_patch_stream_and_logs_do_not_block() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
+        let stream_request = StreamRunEventsRequest {
+            handle: Some(handle.clone()),
+            since_event_seq: 0,
+        };
+        let response = service
+            .stream_run_events(Request::new(stream_request))
+            .await
+            .expect("stream response");
+        let mut stream = response.into_inner();
+
+        let patch =
+            build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("LLM")]));
+        let apply_request = ApplyGraphPatchRequest {
+            handle: Some(handle.clone()),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+        let logs_request = GetLogsRequest {
+            handle: Some(handle),
+            scope_id: String::new(),
+            span_id_hex: String::new(),
+            stage_id: String::new(),
+            node_id: String::new(),
+            page_size: 10,
+            page_token: String::new(),
+        };
+
+        let (apply_response, logs_response, event_result) = tokio::join!(
+            service.apply_graph_patch(Request::new(apply_request)),
+            service.get_logs(Request::new(logs_request)),
+            tokio::time::timeout(Duration::from_secs(1), stream.next())
+        );
+
+        let apply_response = apply_response.expect("apply response").into_inner();
+        assert!(
+            apply_response.accepted,
+            "rejection: {}",
+            apply_response.rejection_reason
+        );
+
+        let logs_response = logs_response.expect("logs response").into_inner();
+        assert!(logs_response.logs.is_empty());
+
+        let event = event_result
+            .expect("event timeout")
+            .expect("event item")
+            .expect("event ok");
+        assert!(matches!(event.event, Some(run_event::Event::GraphPatch(_))));
+    }
+
+    #[tokio::test]
     async fn apply_graph_patch_rejects_sha256_mismatch() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch =
             build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("LLM")]));
         let patch = CanonicalJsonDocument {
@@ -1120,7 +1180,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_accepts_matching_sha256() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch =
             build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("LLM")]));
         let request = ApplyGraphPatchRequest {
@@ -1141,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_patch_seq_gap() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch =
             build_patch_document(&handle.run_id, 2, "stage-a", json!([node_added_op("LLM")]));
         let request = ApplyGraphPatchRequest {
@@ -1165,7 +1225,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_inactive_stage() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch =
             build_patch_document(&handle.run_id, 0, "stage-b", json!([node_added_op("LLM")]));
         let request = ApplyGraphPatchRequest {
@@ -1189,7 +1249,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_disallowed_node_kind() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch =
             build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("TOOL")]));
         let request = ApplyGraphPatchRequest {
@@ -1213,7 +1273,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_side_effect_tool_without_idempotency_key() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["TOOL"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["TOOL"], 0).await;
         let patch = build_patch_document(
             &handle.run_id,
             0,
@@ -1243,7 +1303,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_accepts_side_effect_none_without_idempotency_key() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["TOOL"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["TOOL"], 0).await;
         let patch = build_patch_document(
             &handle.run_id,
             0,
@@ -1271,7 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_invalid_json_pointer() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch = build_patch_document(
             &handle.run_id,
             0,
@@ -1299,7 +1359,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_unknown_node_id() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch = build_patch_document(
             &handle.run_id,
             0,
@@ -1330,7 +1390,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_rejects_cycle_detected() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let patch = build_patch_document(
             &handle.run_id,
             0,
@@ -1363,7 +1423,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_graph_patch_updates_graph_state_and_logs_event() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let ops = json!([
             node_added_op_with_id("node-a", "LLM"),
             node_added_op_with_id("node-b", "LLM"),
@@ -1405,7 +1465,7 @@ mod tests {
         assert_eq!(run_state.pointer("/state/value/ok"), Some(&json!(true)));
 
         let log = service.event_log_for_run(&handle.run_id);
-        let subscription = log.subscribe(0);
+        let subscription = log.subscribe(0).await;
         assert_eq!(subscription.backlog.len(), 1);
         let event = &subscription.backlog[0];
         match event.event.as_ref() {
@@ -1420,17 +1480,19 @@ mod tests {
     async fn apply_graph_patch_updates_stage_patch_only_when_active_stage_touched() {
         let registry: Arc<dyn RunRegistry> = Arc::new(InMemoryRunRegistry::new());
         let service = CorkCoreService::with_run_registry(Arc::clone(&registry));
-        let run = registry.create_run(CreateRunInput {
-            active_stage_id: Some("stage-a".to_string()),
-            active_stage_expansion_policy: Some(ExpansionPolicy {
-                allow_dynamic: true,
-                allow_kinds: vec!["LLM".to_string()],
-            }),
-            next_patch_seq: Some(0),
-            ..Default::default()
-        });
+        let run = registry
+            .create_run(CreateRunInput {
+                active_stage_id: Some("stage-a".to_string()),
+                active_stage_expansion_policy: Some(ExpansionPolicy {
+                    allow_dynamic: true,
+                    allow_kinds: vec!["LLM".to_string()],
+                }),
+                next_patch_seq: Some(0),
+                ..Default::default()
+            })
+            .await;
         let old = SystemTime::now() - Duration::from_secs(30);
-        run.set_last_patch_at(Some(old));
+        run.set_last_patch_at(Some(old)).await;
         let patch = build_patch_document(
             run.run_id(),
             0,
@@ -1450,7 +1512,7 @@ mod tests {
             .expect("apply response")
             .into_inner();
         assert!(response.accepted);
-        assert_eq!(run.last_patch_at(), Some(old));
+        assert_eq!(run.last_patch_at().await, Some(old));
 
         let patch = build_patch_document(
             run.run_id(),
@@ -1471,7 +1533,7 @@ mod tests {
             .expect("apply response")
             .into_inner();
         assert!(response.accepted);
-        let updated = run.last_patch_at().expect("last_patch_at");
+        let updated = run.last_patch_at().await.expect("last_patch_at");
         assert!(updated > old);
     }
 
@@ -1553,7 +1615,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_composite_graph_returns_contract_patches_and_hashes() {
-        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
         let contract = build_contract_document();
         service
             .patch_store

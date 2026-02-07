@@ -1313,7 +1313,7 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 ---
 
-## [ ] CORE-101: async コンテキストの `std::sync::{Mutex,RwLock}` を排除（Tokioでブロックしない）
+## [x] CORE-101: async コンテキストの `std::sync::{Mutex,RwLock}` を排除（Tokioでブロックしない）
 **Priority:** P0
 **Type:** Perf / Stability
 **Depends on:** なし（独立、ただし広範囲変更）
@@ -1328,10 +1328,10 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
   - Supervisor内の単一スレッド所有に寄せられるものはロック自体を消す
 
 **Subtasks**
-- [ ] 置換対象の一覧を作る（ファイル/型/保持時間）
-- [ ] `RunRegistry` / `PatchStore` / `EventLog` / `LogStore` のロックを非ブロッキング化
-- [ ] ロック保持時間を短縮（cloneしてから処理、など）
-- [ ] 並列テスト追加（apply_patch + stream_events + get_logs を同時に叩く）
+- [x] 置換対象の一覧を作る（ファイル/型/保持時間）
+- [x] `RunRegistry` / `PatchStore` / `EventLog` / `LogStore` のロックを非ブロッキング化
+- [x] ロック保持時間を短縮（cloneしてから処理、など）
+- [x] 並列テスト追加（apply_patch + stream_events + get_logs を同時に叩く）
 
 **DoD**
 - `cargo clippy -D warnings` を維持
@@ -1346,6 +1346,15 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 **Docs**
 - docs/adr/ に「asyncロック方針」を1本追加（なぜDashMap/ tokio lock か）
+
+### 進捗
+- [DONE] 置換対象: `crates/cork-store/src/lib.rs`（RunCtx metadata / RunRegistry / PatchStore / GraphStore / StateStore / EventLog / LogStore）、`crates/cork-core/src/api/core_service.rs`（event_logs）。
+  - マップ系は DashMap、共有状態は Tokio RwLock に置換。RunRegistry の run_order は clone してロック保持を短縮。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] 並列テストを追加（apply_graph_patch + stream_run_events + get_logs を同時に実行）。
+  - 変更ファイル: `crates/cork-core/src/api/core_service.rs`。
+- [DONE] ADR 0002（非同期ロック方針）を追加。
+  - 変更ファイル: `docs/adr/0002-async-lock-policy.md`。
 
 
 ---

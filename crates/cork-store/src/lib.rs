@@ -7,13 +7,16 @@
 //! Run registry is implemented for CORE-010. Additional stores are TODO.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use cork_proto::cork::v1::{CanonicalJsonDocument, HashBundle, LogRecord, RunEvent, RunStatus};
+use dashmap::DashMap;
 use serde_json::Value;
+use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -65,36 +68,26 @@ impl RunCtx {
         &self.run_id
     }
 
-    pub fn metadata(&self) -> RunMetadata {
-        self.metadata
-            .read()
-            .expect("run metadata lock poisoned")
-            .clone()
+    pub async fn metadata(&self) -> RunMetadata {
+        self.metadata.read().await.clone()
     }
 
-    pub fn stage_auto_commit(&self) -> Option<StageAutoCommitPolicy> {
-        self.metadata
-            .read()
-            .expect("run metadata lock poisoned")
-            .stage_auto_commit
-            .clone()
+    pub async fn stage_auto_commit(&self) -> Option<StageAutoCommitPolicy> {
+        self.metadata.read().await.stage_auto_commit.clone()
     }
 
-    pub fn next_patch_seq(&self) -> u64 {
-        self.metadata
-            .read()
-            .expect("run metadata lock poisoned")
-            .next_patch_seq
+    pub async fn next_patch_seq(&self) -> u64 {
+        self.metadata.read().await.next_patch_seq
     }
 
-    pub fn set_next_patch_seq(&self, next_patch_seq: u64) {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn set_next_patch_seq(&self, next_patch_seq: u64) {
+        let mut metadata = self.metadata.write().await;
         metadata.next_patch_seq = next_patch_seq;
         metadata.updated_at = SystemTime::now();
     }
 
-    pub fn try_advance_patch_seq(&self, expected: u64) -> Result<u64, u64> {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn try_advance_patch_seq(&self, expected: u64) -> Result<u64, u64> {
+        let mut metadata = self.metadata.write().await;
         if metadata.next_patch_seq != expected {
             return Err(metadata.next_patch_seq);
         }
@@ -103,75 +96,65 @@ impl RunCtx {
         Ok(metadata.next_patch_seq)
     }
 
-    pub fn check_patch_seq(&self, expected: u64) -> Result<(), u64> {
-        let metadata = self.metadata.read().expect("run metadata lock poisoned");
+    pub async fn check_patch_seq(&self, expected: u64) -> Result<(), u64> {
+        let metadata = self.metadata.read().await;
         if metadata.next_patch_seq != expected {
             return Err(metadata.next_patch_seq);
         }
         Ok(())
     }
 
-    pub fn advance_patch_seq(&self) -> u64 {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn advance_patch_seq(&self) -> u64 {
+        let mut metadata = self.metadata.write().await;
         metadata.next_patch_seq = metadata.next_patch_seq.saturating_add(1);
         metadata.updated_at = SystemTime::now();
         metadata.next_patch_seq
     }
 
-    pub fn active_stage_id(&self) -> Option<String> {
-        self.metadata
-            .read()
-            .expect("run metadata lock poisoned")
-            .active_stage_id
-            .clone()
+    pub async fn active_stage_id(&self) -> Option<String> {
+        self.metadata.read().await.active_stage_id.clone()
     }
 
-    pub fn active_stage_expansion_policy(&self) -> Option<ExpansionPolicy> {
+    pub async fn active_stage_expansion_policy(&self) -> Option<ExpansionPolicy> {
         self.metadata
             .read()
-            .expect("run metadata lock poisoned")
+            .await
             .active_stage_expansion_policy
             .clone()
     }
 
-    pub fn stage_started_at(&self) -> Option<SystemTime> {
-        self.metadata
-            .read()
-            .expect("run metadata lock poisoned")
-            .stage_started_at
+    pub async fn stage_started_at(&self) -> Option<SystemTime> {
+        self.metadata.read().await.stage_started_at
     }
 
-    pub fn last_patch_at(&self) -> Option<SystemTime> {
-        self.metadata
-            .read()
-            .expect("run metadata lock poisoned")
-            .last_patch_at
+    pub async fn last_patch_at(&self) -> Option<SystemTime> {
+        self.metadata.read().await.last_patch_at
     }
 
-    pub fn set_stage_started_at(&self, stage_started_at: Option<SystemTime>) {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn set_stage_started_at(&self, stage_started_at: Option<SystemTime>) {
+        let mut metadata = self.metadata.write().await;
         metadata.stage_started_at = stage_started_at;
         metadata.updated_at = SystemTime::now();
     }
 
-    pub fn set_last_patch_at(&self, last_patch_at: Option<SystemTime>) {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn set_last_patch_at(&self, last_patch_at: Option<SystemTime>) {
+        let mut metadata = self.metadata.write().await;
         metadata.last_patch_at = last_patch_at;
         metadata.updated_at = SystemTime::now();
     }
 
-    pub fn touch_stage_patch(&self) {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn touch_stage_patch(&self) {
+        let mut metadata = self.metadata.write().await;
         metadata.last_patch_at = Some(SystemTime::now());
         metadata.updated_at = SystemTime::now();
     }
 
-    pub fn set_active_stage(
+    pub async fn set_active_stage(
         &self,
         active_stage_id: Option<String>,
         active_stage_expansion_policy: Option<ExpansionPolicy>,
     ) {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+        let mut metadata = self.metadata.write().await;
         metadata.active_stage_id = active_stage_id;
         metadata.active_stage_expansion_policy = active_stage_expansion_policy;
         if metadata.active_stage_id.is_some() {
@@ -185,14 +168,14 @@ impl RunCtx {
         metadata.updated_at = SystemTime::now();
     }
 
-    pub fn set_status(&self, status: RunStatus) {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn set_status(&self, status: RunStatus) {
+        let mut metadata = self.metadata.write().await;
         metadata.status = status;
         metadata.updated_at = SystemTime::now();
     }
 
-    pub fn set_hash_bundle(&self, hash_bundle: Option<HashBundle>) {
-        let mut metadata = self.metadata.write().expect("run metadata lock poisoned");
+    pub async fn set_hash_bundle(&self, hash_bundle: Option<HashBundle>) {
+        let mut metadata = self.metadata.write().await;
         metadata.hash_bundle = hash_bundle;
         metadata.updated_at = SystemTime::now();
     }
@@ -225,11 +208,16 @@ pub struct RunPage {
     pub next_page_token: Option<String>,
 }
 
+#[async_trait]
 pub trait RunRegistry: Send + Sync {
-    fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx>;
-    fn get_run(&self, run_id: &str) -> Option<Arc<RunCtx>>;
-    fn list_runs(&self, page_token: Option<&str>, filters: RunFilters, page_size: usize)
-    -> RunPage;
+    async fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx>;
+    async fn get_run(&self, run_id: &str) -> Option<Arc<RunCtx>>;
+    async fn list_runs(
+        &self,
+        page_token: Option<&str>,
+        filters: RunFilters,
+        page_size: usize,
+    ) -> RunPage;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,7 +239,7 @@ pub trait PatchStore: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryPatchStore {
-    runs: RwLock<HashMap<String, PatchState>>,
+    runs: DashMap<String, PatchState>,
 }
 
 #[derive(Debug, Default)]
@@ -268,14 +256,13 @@ impl InMemoryPatchStore {
 
 impl PatchStore for InMemoryPatchStore {
     fn set_contract_manifest(&self, run_id: &str, contract: CanonicalJsonDocument) {
-        let mut runs = self.runs.write().expect("patch store lock poisoned");
-        let state = runs.entry(run_id.to_string()).or_default();
+        let mut state = self.runs.entry(run_id.to_string()).or_default();
         state.contract_manifest = Some(contract);
     }
 
     fn contract_manifest(&self, run_id: &str) -> Option<CanonicalJsonDocument> {
-        let runs = self.runs.read().expect("patch store lock poisoned");
-        runs.get(run_id)
+        self.runs
+            .get(run_id)
             .and_then(|state| state.contract_manifest.clone())
     }
 
@@ -285,8 +272,7 @@ impl PatchStore for InMemoryPatchStore {
         patch_seq: u64,
         patch: CanonicalJsonDocument,
     ) -> Result<(), PatchStoreError> {
-        let mut runs = self.runs.write().expect("patch store lock poisoned");
-        let state = runs.entry(run_id.to_string()).or_default();
+        let mut state = self.runs.entry(run_id.to_string()).or_default();
         let expected = state.patches.len() as u64;
         if patch_seq != expected {
             return Err(PatchStoreError::PatchSeqMismatch {
@@ -299,8 +285,8 @@ impl PatchStore for InMemoryPatchStore {
     }
 
     fn patches_in_order(&self, run_id: &str) -> Vec<CanonicalJsonDocument> {
-        let runs = self.runs.read().expect("patch store lock poisoned");
-        runs.get(run_id)
+        self.runs
+            .get(run_id)
             .map(|state| state.patches.clone())
             .unwrap_or_default()
     }
@@ -342,7 +328,7 @@ pub trait GraphStore: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryGraphStore {
-    graphs: RwLock<HashMap<String, GraphState>>,
+    graphs: DashMap<String, GraphState>,
 }
 
 #[derive(Debug, Default)]
@@ -359,8 +345,7 @@ impl InMemoryGraphStore {
 
 impl GraphStore for InMemoryGraphStore {
     fn add_node(&self, run_id: &str, node: NodeSpec) -> Result<(), GraphStoreError> {
-        let mut graphs = self.graphs.write().expect("graph store lock poisoned");
-        let graph = graphs.entry(run_id.to_string()).or_default();
+        let mut graph = self.graphs.entry(run_id.to_string()).or_default();
         if graph.nodes.contains_key(&node.node_id) {
             return Err(GraphStoreError::NodeAlreadyExists(node.node_id));
         }
@@ -371,8 +356,7 @@ impl GraphStore for InMemoryGraphStore {
     }
 
     fn add_edge(&self, run_id: &str, from: &str, to: &str) -> Result<(), GraphStoreError> {
-        let mut graphs = self.graphs.write().expect("graph store lock poisoned");
-        let graph = graphs.entry(run_id.to_string()).or_default();
+        let mut graph = self.graphs.entry(run_id.to_string()).or_default();
         if !graph.nodes.contains_key(from) {
             return Err(GraphStoreError::NodeNotFound(from.to_string()));
         }
@@ -385,12 +369,15 @@ impl GraphStore for InMemoryGraphStore {
                 to: to.to_string(),
             });
         }
-        let deps = graph.edges.entry(to.to_string()).or_default();
-        if !deps.iter().any(|dep| dep == from) {
-            deps.push(from.to_string());
-        }
+        let deps_snapshot = {
+            let deps = graph.edges.entry(to.to_string()).or_default();
+            if !deps.iter().any(|dep| dep == from) {
+                deps.push(from.to_string());
+            }
+            deps.clone()
+        };
         if let Some(node) = graph.nodes.get_mut(to) {
-            node.deps = deps.clone();
+            node.deps = deps_snapshot;
         }
         Ok(())
     }
@@ -403,8 +390,7 @@ impl GraphStore for InMemoryGraphStore {
         scheduling: Option<Value>,
         htn: Option<Value>,
     ) -> Result<(), GraphStoreError> {
-        let mut graphs = self.graphs.write().expect("graph store lock poisoned");
-        let graph = graphs.entry(run_id.to_string()).or_default();
+        let mut graph = self.graphs.entry(run_id.to_string()).or_default();
         let Some(node) = graph.nodes.get_mut(node_id) else {
             return Err(GraphStoreError::NodeNotFound(node_id.to_string()));
         };
@@ -421,15 +407,13 @@ impl GraphStore for InMemoryGraphStore {
     }
 
     fn node(&self, run_id: &str, node_id: &str) -> Option<NodeSpec> {
-        let graphs = self.graphs.read().expect("graph store lock poisoned");
-        graphs
+        self.graphs
             .get(run_id)
             .and_then(|graph| graph.nodes.get(node_id).cloned())
     }
 
     fn deps(&self, run_id: &str, node_id: &str) -> Option<Vec<String>> {
-        let graphs = self.graphs.read().expect("graph store lock poisoned");
-        graphs
+        self.graphs
             .get(run_id)
             .and_then(|graph| graph.edges.get(node_id).cloned())
     }
@@ -526,14 +510,24 @@ pub trait StateStore: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryStateStore {
-    states: RwLock<HashMap<String, RunStateStore>>,
+    states: DashMap<String, RunStateStore>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RunStateStore {
     run_state: Value,
     stage_state: HashMap<String, Value>,
     node_outputs: HashMap<String, NodeOutput>,
+}
+
+impl Default for RunStateStore {
+    fn default() -> Self {
+        Self {
+            run_state: Value::Object(serde_json::Map::new()),
+            stage_state: HashMap::new(),
+            node_outputs: HashMap::new(),
+        }
+    }
 }
 
 impl InMemoryStateStore {
@@ -551,14 +545,7 @@ impl StateStore for InMemoryStateStore {
         json_pointer: &str,
         value: Value,
     ) -> Result<(), StateStoreError> {
-        let mut states = self.states.write().expect("state store lock poisoned");
-        let state = states
-            .entry(run_id.to_string())
-            .or_insert_with(|| RunStateStore {
-                run_state: Value::Object(serde_json::Map::new()),
-                stage_state: HashMap::new(),
-                node_outputs: HashMap::new(),
-            });
+        let mut state = self.states.entry(run_id.to_string()).or_default();
         match scope {
             "RUN" => apply_pointer_mut(&mut state.run_state, json_pointer, value),
             "STAGE" => {
@@ -576,32 +563,22 @@ impl StateStore for InMemoryStateStore {
     }
 
     fn run_state(&self, run_id: &str) -> Option<Value> {
-        let states = self.states.read().expect("state store lock poisoned");
-        states.get(run_id).map(|state| state.run_state.clone())
+        self.states.get(run_id).map(|state| state.run_state.clone())
     }
 
     fn stage_state(&self, run_id: &str, stage_id: &str) -> Option<Value> {
-        let states = self.states.read().expect("state store lock poisoned");
-        states
+        self.states
             .get(run_id)
             .and_then(|state| state.stage_state.get(stage_id).cloned())
     }
 
     fn set_node_output(&self, run_id: &str, node_id: &str, output: NodeOutput) {
-        let mut states = self.states.write().expect("state store lock poisoned");
-        let state = states
-            .entry(run_id.to_string())
-            .or_insert_with(|| RunStateStore {
-                run_state: Value::Object(serde_json::Map::new()),
-                stage_state: HashMap::new(),
-                node_outputs: HashMap::new(),
-            });
+        let mut state = self.states.entry(run_id.to_string()).or_default();
         state.node_outputs.insert(node_id.to_string(), output);
     }
 
     fn node_output(&self, run_id: &str, node_id: &str) -> Option<NodeOutput> {
-        let states = self.states.read().expect("state store lock poisoned");
-        states
+        self.states
             .get(run_id)
             .and_then(|state| state.node_outputs.get(node_id).cloned())
     }
@@ -692,25 +669,30 @@ fn ensure_pointer_path_recursive(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryRunRegistry {
-    store: RwLock<RunStore>,
-}
-
-#[derive(Debug, Default)]
-struct RunStore {
-    runs_by_id: HashMap<String, Arc<RunCtx>>,
-    run_order: Vec<String>,
+    runs_by_id: DashMap<String, Arc<RunCtx>>,
+    run_order: RwLock<Vec<String>>,
 }
 
 impl InMemoryRunRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            runs_by_id: DashMap::new(),
+            run_order: RwLock::new(Vec::new()),
+        }
     }
 }
 
+impl Default for InMemoryRunRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
 impl RunRegistry for InMemoryRunRegistry {
-    fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx> {
+    async fn create_run(&self, input: CreateRunInput) -> Arc<RunCtx> {
         let run_id = generate_run_id();
         let now = SystemTime::now();
         let mut stage_started_at = input.stage_started_at;
@@ -739,19 +721,17 @@ impl RunRegistry for InMemoryRunRegistry {
         };
         let run_ctx = Arc::new(RunCtx::new(run_id.clone(), metadata));
 
-        let mut store = self.store.write().expect("run store lock poisoned");
-        store.run_order.push(run_id.clone());
-        store.runs_by_id.insert(run_id, Arc::clone(&run_ctx));
+        self.runs_by_id.insert(run_id.clone(), Arc::clone(&run_ctx));
+        self.run_order.write().await.push(run_id);
 
         run_ctx
     }
 
-    fn get_run(&self, run_id: &str) -> Option<Arc<RunCtx>> {
-        let store = self.store.read().expect("run store lock poisoned");
-        store.runs_by_id.get(run_id).cloned()
+    async fn get_run(&self, run_id: &str) -> Option<Arc<RunCtx>> {
+        self.runs_by_id.get(run_id).map(|run| Arc::clone(&*run))
     }
 
-    fn list_runs(
+    async fn list_runs(
         &self,
         page_token: Option<&str>,
         filters: RunFilters,
@@ -764,13 +744,13 @@ impl RunRegistry for InMemoryRunRegistry {
             };
         }
 
-        let store = self.store.read().expect("run store lock poisoned");
+        let run_order = self.run_order.read().await.clone();
         let mut filtered = Vec::new();
-        for run_id in &store.run_order {
-            let Some(run_ctx) = store.runs_by_id.get(run_id) else {
+        for run_id in &run_order {
+            let Some(run_ctx) = self.runs_by_id.get(run_id) else {
                 continue;
             };
-            let metadata = run_ctx.metadata();
+            let metadata = run_ctx.metadata().await;
             if let Some(ref experiment_id) = filters.experiment_id
                 && metadata.experiment_id.as_ref() != Some(experiment_id)
             {
@@ -786,7 +766,7 @@ impl RunRegistry for InMemoryRunRegistry {
             {
                 continue;
             }
-            filtered.push(Arc::clone(run_ctx));
+            filtered.push(Arc::clone(&*run_ctx));
         }
 
         let offset = decode_page_token(page_token).unwrap_or(0);
@@ -827,9 +807,10 @@ pub struct EventSubscription {
     pub receiver: broadcast::Receiver<RunEvent>,
 }
 
+#[async_trait]
 pub trait EventLog: Send + Sync {
-    fn append(&self, event: RunEvent) -> RunEvent;
-    fn subscribe(&self, since_seq: u64) -> EventSubscription;
+    async fn append(&self, event: RunEvent) -> RunEvent;
+    async fn subscribe(&self, since_seq: u64) -> EventSubscription;
 }
 
 #[derive(Debug)]
@@ -863,9 +844,10 @@ impl Default for InMemoryEventLog {
     }
 }
 
+#[async_trait]
 impl EventLog for InMemoryEventLog {
-    fn append(&self, mut event: RunEvent) -> RunEvent {
-        let mut state = self.state.write().expect("event log lock poisoned");
+    async fn append(&self, mut event: RunEvent) -> RunEvent {
+        let mut state = self.state.write().await;
         let seq = state.next_seq;
         state.next_seq = state.next_seq.saturating_add(1);
         event.event_seq = seq as i64;
@@ -875,10 +857,10 @@ impl EventLog for InMemoryEventLog {
         event
     }
 
-    fn subscribe(&self, since_seq: u64) -> EventSubscription {
+    async fn subscribe(&self, since_seq: u64) -> EventSubscription {
         let receiver = self.sender.subscribe();
         let backlog = {
-            let state = self.state.read().expect("event log lock poisoned");
+            let state = self.state.read().await;
             let start = usize::try_from(since_seq).unwrap_or(state.events.len());
             if start >= state.events.len() {
                 Vec::new()
@@ -917,7 +899,7 @@ pub trait LogStore: Send + Sync {
 
 #[derive(Debug)]
 pub struct InMemoryLogStore {
-    runs: RwLock<HashMap<String, RunLogState>>,
+    runs: DashMap<String, RunLogState>,
 }
 
 #[derive(Debug)]
@@ -929,7 +911,7 @@ struct RunLogState {
 impl InMemoryLogStore {
     pub fn new() -> Self {
         Self {
-            runs: RwLock::new(HashMap::new()),
+            runs: DashMap::new(),
         }
     }
 
@@ -971,8 +953,8 @@ impl LogStore for InMemoryLogStore {
         node_id: &str,
         mut log: LogRecord,
     ) -> LogRecord {
-        let mut runs = self.runs.write().expect("log store lock poisoned");
-        let state = runs
+        let mut state = self
+            .runs
             .entry(run_id.to_string())
             .or_insert_with(|| RunLogState {
                 logs: Vec::new(),
@@ -996,8 +978,7 @@ impl LogStore for InMemoryLogStore {
         filters: LogFilters,
         page_size: usize,
     ) -> LogPage {
-        let runs = self.runs.read().expect("log store lock poisoned");
-        let state = match runs.get(run_id) {
+        let state = match self.runs.get(run_id) {
             Some(state) => state,
             None => {
                 return LogPage {
@@ -1054,24 +1035,26 @@ mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
 
-    #[test]
-    fn create_and_get_run() {
+    #[tokio::test]
+    async fn create_and_get_run() {
         let registry = InMemoryRunRegistry::new();
-        let run = registry.create_run(CreateRunInput {
-            experiment_id: Some("exp-1".to_string()),
-            variant_id: Some("var-1".to_string()),
-            stage_auto_commit: Some(StageAutoCommitPolicy {
-                enabled: true,
-                quiescence_ms: 10,
-                max_open_ms: 20,
-                exclude_when_waiting: false,
-            }),
-            ..Default::default()
-        });
+        let run = registry
+            .create_run(CreateRunInput {
+                experiment_id: Some("exp-1".to_string()),
+                variant_id: Some("var-1".to_string()),
+                stage_auto_commit: Some(StageAutoCommitPolicy {
+                    enabled: true,
+                    quiescence_ms: 10,
+                    max_open_ms: 20,
+                    exclude_when_waiting: false,
+                }),
+                ..Default::default()
+            })
+            .await;
 
-        let fetched = registry.get_run(run.run_id()).expect("run exists");
+        let fetched = registry.get_run(run.run_id()).await.expect("run exists");
         assert_eq!(run.run_id(), fetched.run_id());
-        let metadata = fetched.metadata();
+        let metadata = fetched.metadata().await;
         assert_eq!(metadata.status, RunStatus::RunPending);
         assert_eq!(metadata.experiment_id.as_deref(), Some("exp-1"));
         assert_eq!(metadata.variant_id.as_deref(), Some("var-1"));
@@ -1082,7 +1065,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(
-            run.stage_auto_commit(),
+            run.stage_auto_commit().await,
             Some(StageAutoCommitPolicy {
                 enabled: true,
                 quiescence_ms: 10,
@@ -1092,17 +1075,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn try_advance_patch_seq_is_atomic() {
+    #[tokio::test]
+    async fn try_advance_patch_seq_is_atomic() {
         let registry = InMemoryRunRegistry::new();
-        let run = registry.create_run(CreateRunInput {
-            next_patch_seq: Some(0),
-            ..Default::default()
-        });
+        let run = registry
+            .create_run(CreateRunInput {
+                next_patch_seq: Some(0),
+                ..Default::default()
+            })
+            .await;
 
-        assert_eq!(run.try_advance_patch_seq(0), Ok(1));
-        assert_eq!(run.try_advance_patch_seq(0), Err(1));
-        assert_eq!(run.try_advance_patch_seq(1), Ok(2));
+        assert_eq!(run.try_advance_patch_seq(0).await, Ok(1));
+        assert_eq!(run.try_advance_patch_seq(0).await, Err(1));
+        assert_eq!(run.try_advance_patch_seq(1).await, Ok(2));
     }
 
     #[test]
@@ -1140,59 +1125,71 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn list_runs_with_paging_and_filters() {
+    #[tokio::test]
+    async fn list_runs_with_paging_and_filters() {
         let registry = InMemoryRunRegistry::new();
-        let run_a = registry.create_run(CreateRunInput {
-            experiment_id: Some("exp-1".to_string()),
-            status: Some(RunStatus::RunPending),
-            ..Default::default()
-        });
-        let _run_b = registry.create_run(CreateRunInput {
-            experiment_id: Some("exp-1".to_string()),
-            status: Some(RunStatus::RunRunning),
-            ..Default::default()
-        });
-        let run_c = registry.create_run(CreateRunInput {
-            experiment_id: Some("exp-2".to_string()),
-            status: Some(RunStatus::RunPending),
-            ..Default::default()
-        });
-
-        let page1 = registry.list_runs(
-            None,
-            RunFilters {
+        let run_a = registry
+            .create_run(CreateRunInput {
                 experiment_id: Some("exp-1".to_string()),
-                variant_id: None,
-                status: None,
-            },
-            1,
-        );
+                status: Some(RunStatus::RunPending),
+                ..Default::default()
+            })
+            .await;
+        let _run_b = registry
+            .create_run(CreateRunInput {
+                experiment_id: Some("exp-1".to_string()),
+                status: Some(RunStatus::RunRunning),
+                ..Default::default()
+            })
+            .await;
+        let run_c = registry
+            .create_run(CreateRunInput {
+                experiment_id: Some("exp-2".to_string()),
+                status: Some(RunStatus::RunPending),
+                ..Default::default()
+            })
+            .await;
+
+        let page1 = registry
+            .list_runs(
+                None,
+                RunFilters {
+                    experiment_id: Some("exp-1".to_string()),
+                    variant_id: None,
+                    status: None,
+                },
+                1,
+            )
+            .await;
         assert_eq!(page1.runs.len(), 1);
         assert_eq!(page1.runs[0].run_id(), run_a.run_id());
         let token = page1.next_page_token.expect("next token");
 
-        let page2 = registry.list_runs(
-            Some(&token),
-            RunFilters {
-                experiment_id: Some("exp-1".to_string()),
-                variant_id: None,
-                status: None,
-            },
-            1,
-        );
+        let page2 = registry
+            .list_runs(
+                Some(&token),
+                RunFilters {
+                    experiment_id: Some("exp-1".to_string()),
+                    variant_id: None,
+                    status: None,
+                },
+                1,
+            )
+            .await;
         assert_eq!(page2.runs.len(), 1);
         assert!(page2.next_page_token.is_none());
 
-        let status_filtered = registry.list_runs(
-            None,
-            RunFilters {
-                experiment_id: None,
-                variant_id: None,
-                status: Some(RunStatus::RunPending),
-            },
-            10,
-        );
+        let status_filtered = registry
+            .list_runs(
+                None,
+                RunFilters {
+                    experiment_id: None,
+                    variant_id: None,
+                    status: Some(RunStatus::RunPending),
+                },
+                10,
+            )
+            .await;
         let ids: Vec<_> = status_filtered
             .runs
             .iter()
@@ -1209,11 +1206,11 @@ mod tests {
         assert_eq!(decoded, Some(42));
     }
 
-    #[test]
-    fn append_assigns_contiguous_event_seq() {
+    #[tokio::test]
+    async fn append_assigns_contiguous_event_seq() {
         let log = InMemoryEventLog::new();
-        let first = log.append(RunEvent::default());
-        let second = log.append(RunEvent::default());
+        let first = log.append(RunEvent::default()).await;
+        let second = log.append(RunEvent::default()).await;
         assert_eq!(first.event_seq, 0);
         assert_eq!(second.event_seq, 1);
     }
@@ -1293,20 +1290,20 @@ mod tests {
     #[tokio::test]
     async fn subscribe_returns_backlog_and_live_events() {
         let log = InMemoryEventLog::new();
-        log.append(RunEvent::default());
+        log.append(RunEvent::default()).await;
 
-        let mut subscription = log.subscribe(0);
+        let mut subscription = log.subscribe(0).await;
         assert_eq!(subscription.backlog.len(), 1);
         assert_eq!(subscription.backlog[0].event_seq, 0);
 
-        log.append(RunEvent::default());
+        log.append(RunEvent::default()).await;
         let received = timeout(Duration::from_secs(1), subscription.receiver.recv())
             .await
             .expect("recv timeout")
             .expect("recv failed");
         assert_eq!(received.event_seq, 1);
 
-        let empty = log.subscribe(2);
+        let empty = log.subscribe(2).await;
         assert!(empty.backlog.is_empty());
     }
 

@@ -9,3 +9,5 @@ base64 = { workspace = true }
 uuid = { workspace = true }
 cork-proto = { workspace = true }
 tokio = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }

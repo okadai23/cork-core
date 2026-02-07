@@ -80,11 +80,11 @@ impl WorkerClient {
         match self.client.invoke_tool(request).await {
             Ok(response) => {
                 let response = response.into_inner();
-                handle_success(context, &response);
+                handle_success(context, &response).await;
                 Ok(response)
             }
             Err(status) => {
-                handle_failure(context, &status);
+                handle_failure(context, &status).await;
                 Err(status)
             }
         }
@@ -99,7 +99,7 @@ impl WorkerClient {
         let mut stream = match self.client.invoke_tool_stream(request).await {
             Ok(response) => response.into_inner(),
             Err(status) => {
-                handle_failure(context, &status);
+                handle_failure(context, &status).await;
                 return Err(status);
             }
         };
@@ -108,12 +108,12 @@ impl WorkerClient {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => {
-                    if let Some(action) = handle_chunk(context, &chunk) {
+                    if let Some(action) = handle_chunk(context, &chunk).await {
                         final_response = Some(action);
                     }
                 }
                 Err(status) => {
-                    handle_failure(context, &status);
+                    handle_failure(context, &status).await;
                     return Err(status);
                 }
             }
@@ -121,11 +121,11 @@ impl WorkerClient {
 
         let Some(final_response) = final_response else {
             let status = Status::data_loss("invoke tool stream ended without final response");
-            handle_failure(context, &status);
+            handle_failure(context, &status).await;
             return Err(status);
         };
 
-        handle_success(context, &final_response);
+        handle_success(context, &final_response).await;
         Ok(final_response)
     }
 }
@@ -160,7 +160,7 @@ fn merge_deadline(
     }
 }
 
-fn handle_chunk(
+async fn handle_chunk(
     context: &InvocationContext<'_>,
     chunk: &InvokeToolStreamChunk,
 ) -> Option<InvokeToolResponse> {
@@ -174,7 +174,8 @@ fn handle_chunk(
                 context.node_id,
                 log.clone(),
                 chunk.ts,
-            );
+            )
+            .await;
             None
         }
         Some(Chunk::Final(response)) => Some(response.clone()),
@@ -182,7 +183,7 @@ fn handle_chunk(
     }
 }
 
-fn handle_success(context: &InvocationContext<'_>, response: &InvokeToolResponse) {
+async fn handle_success(context: &InvocationContext<'_>, response: &InvokeToolResponse) {
     let output = node_output_from_response(response);
     context
         .state_store
@@ -194,10 +195,11 @@ fn handle_success(context: &InvocationContext<'_>, response: &InvokeToolResponse
         NodeStatus::NodeRunning,
         NodeStatus::NodeSucceeded,
         None,
-    );
+    )
+    .await;
 }
 
-fn handle_failure(context: &InvocationContext<'_>, status: &Status) {
+async fn handle_failure(context: &InvocationContext<'_>, status: &Status) {
     append_node_state(
         context.event_log,
         context.stage_id,
@@ -205,7 +207,8 @@ fn handle_failure(context: &InvocationContext<'_>, status: &Status) {
         NodeStatus::NodeRunning,
         NodeStatus::NodeFailed,
         Some(format!("gRPC {:?}: {}", status.code(), status.message())),
-    );
+    )
+    .await;
 }
 
 fn node_output_from_response(response: &InvokeToolResponse) -> NodeOutput {
@@ -243,7 +246,7 @@ fn artifact_from_proto(artifact: &ProtoArtifactRef) -> ArtifactRef {
     }
 }
 
-fn append_log(
+async fn append_log(
     event_log: &dyn EventLog,
     log_store: &dyn LogStore,
     run_id: &str,
@@ -260,10 +263,10 @@ fn append_log(
         ts: Some(timestamp),
         event: Some(run_event::Event::Log(log)),
     };
-    event_log.append(event);
+    event_log.append(event).await;
 }
 
-fn append_node_state(
+async fn append_node_state(
     event_log: &dyn EventLog,
     stage_id: &str,
     node_id: &str,
@@ -282,7 +285,7 @@ fn append_node_state(
             reason: reason.unwrap_or_default(),
         })),
     };
-    event_log.append(event);
+    event_log.append(event).await;
 }
 
 fn timeout_from_budget(now: SystemTime, budget: &InvocationBudget) -> Option<Duration> {
@@ -508,7 +511,7 @@ mod tests {
             .expect("output");
         assert_eq!(output.payload.data, b"ok");
 
-        let events = event_log.subscribe(0).backlog;
+        let events = event_log.subscribe(0).await.backlog;
         assert!(events.iter().any(|event| matches!(
             event.event.as_ref(),
             Some(run_event::Event::NodeState(NodeStateChanged { new_status, .. }))
@@ -552,7 +555,7 @@ mod tests {
             .expect("invoke stream");
         assert!(response.output.is_some());
 
-        let events = event_log.subscribe(0).backlog;
+        let events = event_log.subscribe(0).await.backlog;
         assert!(events.iter().any(|event| matches!(
             event.event.as_ref(),
             Some(run_event::Event::Log(LogRecord { message, .. }))
