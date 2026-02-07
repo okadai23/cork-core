@@ -1,7 +1,89 @@
+use std::fmt;
+
 use cork_hash::{composite_graph_hash, patch_hash};
 use cork_proto::cork::v1::{CanonicalJsonDocument, HashBundle, Sha256};
 use cork_store::{GraphStore, GraphStoreError, NodeSpec, RunCtx, StateStore, StateStoreError};
 use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchRejectReason {
+    Sha256Mismatch {
+        expected: String,
+        provided: String,
+    },
+    PatchSeqGap {
+        expected: u64,
+        provided: u64,
+    },
+    StageNotActive {
+        active_stage_id: Option<String>,
+        provided_stage_id: String,
+    },
+    ExpansionPolicyMissing,
+    DynamicNodesNotAllowed,
+    KindNotAllowed {
+        kind: String,
+    },
+    IdempotencyRequired,
+    InvalidJsonPointer {
+        pointer: String,
+    },
+    UnknownNodeId {
+        node_id: String,
+    },
+    CycleDetected {
+        from: String,
+        to: String,
+    },
+    InvalidPatch {
+        message: String,
+    },
+}
+
+impl fmt::Display for PatchRejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PatchRejectReason::Sha256Mismatch { expected, provided } => write!(
+                f,
+                "sha256 mismatch (expected {expected}, provided {provided})"
+            ),
+            PatchRejectReason::PatchSeqGap { expected, provided } => {
+                write!(
+                    f,
+                    "patch_seq gap (expected {expected}, provided {provided})"
+                )
+            }
+            PatchRejectReason::StageNotActive {
+                active_stage_id,
+                provided_stage_id,
+            } => write!(
+                f,
+                "stage not active (active {}, provided {provided_stage_id})",
+                active_stage_id
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            PatchRejectReason::ExpansionPolicyMissing => write!(f, "expansion_policy missing"),
+            PatchRejectReason::DynamicNodesNotAllowed => {
+                write!(f, "dynamic nodes not allowed in active stage")
+            }
+            PatchRejectReason::KindNotAllowed { kind } => {
+                write!(f, "node kind not allowed: {kind}")
+            }
+            PatchRejectReason::IdempotencyRequired => {
+                write!(f, "idempotency_key required for side_effect")
+            }
+            PatchRejectReason::InvalidJsonPointer { pointer } => {
+                write!(f, "invalid json pointer: {pointer}")
+            }
+            PatchRejectReason::UnknownNodeId { node_id } => write!(f, "unknown node_id: {node_id}"),
+            PatchRejectReason::CycleDetected { from, to } => {
+                write!(f, "cycle detected: {from} -> {to}")
+            }
+            PatchRejectReason::InvalidPatch { message } => write!(f, "invalid patch: {message}"),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum GraphPatchApplyError {
@@ -16,6 +98,36 @@ impl GraphPatchApplyError {
             GraphPatchApplyError::InvalidPatch(message) => message.clone(),
             GraphPatchApplyError::GraphStore(err) => format!("graph store error: {err:?}"),
             GraphPatchApplyError::StateStore(err) => format!("state store error: {err:?}"),
+        }
+    }
+
+    pub fn reject_reason(&self) -> PatchRejectReason {
+        match self {
+            GraphPatchApplyError::InvalidPatch(message) => PatchRejectReason::InvalidPatch {
+                message: message.clone(),
+            },
+            GraphPatchApplyError::GraphStore(err) => match err {
+                GraphStoreError::NodeAlreadyExists(node_id) => PatchRejectReason::InvalidPatch {
+                    message: format!("node already exists: {node_id}"),
+                },
+                GraphStoreError::NodeNotFound(node_id) => PatchRejectReason::UnknownNodeId {
+                    node_id: node_id.clone(),
+                },
+                GraphStoreError::CycleDetected { from, to } => PatchRejectReason::CycleDetected {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+            },
+            GraphPatchApplyError::StateStore(err) => match err {
+                StateStoreError::InvalidJsonPointer(pointer) => {
+                    PatchRejectReason::InvalidJsonPointer {
+                        pointer: pointer.clone(),
+                    }
+                }
+                StateStoreError::MissingStageId => PatchRejectReason::InvalidPatch {
+                    message: "stage_id is required for STAGE scope".to_string(),
+                },
+            },
         }
     }
 }

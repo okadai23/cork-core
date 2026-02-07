@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::patch::apply_graph_patch_ops;
+use crate::engine::patch::{PatchRejectReason, apply_graph_patch_ops};
 use crate::engine::run::node_stage_id;
 use cork_hash::{composite_graph_hash, contract_hash, patch_hash, sha256};
 use cork_proto::cork::v1::run_event;
@@ -95,64 +95,6 @@ enum Sha256Verification {
 }
 
 #[derive(Debug)]
-enum GraphPatchRejectionReason {
-    Sha256Mismatch {
-        expected: String,
-        provided: String,
-    },
-    PatchSeqMismatch {
-        expected: u64,
-        provided: u64,
-    },
-    StageNotActive {
-        active_stage_id: Option<String>,
-        provided_stage_id: String,
-    },
-    MissingExpansionPolicy,
-    DynamicNodesNotAllowed,
-    NodeKindNotAllowed {
-        kind: String,
-    },
-    InvalidPatch {
-        message: String,
-    },
-}
-
-impl GraphPatchRejectionReason {
-    fn message(&self) -> String {
-        match self {
-            GraphPatchRejectionReason::Sha256Mismatch { expected, provided } => {
-                format!("sha256 mismatch (expected {expected}, provided {provided})")
-            }
-            GraphPatchRejectionReason::PatchSeqMismatch { expected, provided } => {
-                format!("patch_seq mismatch (expected {expected}, provided {provided})")
-            }
-            GraphPatchRejectionReason::StageNotActive {
-                active_stage_id,
-                provided_stage_id,
-            } => format!(
-                "stage_id not active (active {}, provided {provided_stage_id})",
-                active_stage_id
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string())
-            ),
-            GraphPatchRejectionReason::MissingExpansionPolicy => {
-                "expansion_policy missing".to_string()
-            }
-            GraphPatchRejectionReason::DynamicNodesNotAllowed => {
-                "dynamic nodes not allowed in active stage".to_string()
-            }
-            GraphPatchRejectionReason::NodeKindNotAllowed { kind } => {
-                format!("node kind not allowed: {kind}")
-            }
-            GraphPatchRejectionReason::InvalidPatch { message } => {
-                format!("invalid patch: {message}")
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
 struct GraphPatchMetadata {
     patch_seq: u64,
     stage_id: String,
@@ -214,29 +156,29 @@ fn verify_canonical_sha256(doc: &CanonicalJsonDocument) -> Result<Sha256Verifica
 
 fn parse_graph_patch_metadata(
     patch: &CanonicalJsonDocument,
-) -> Result<GraphPatchMetadata, GraphPatchRejectionReason> {
+) -> Result<GraphPatchMetadata, PatchRejectReason> {
     let value: Value = serde_json::from_slice(&patch.canonical_json_utf8).map_err(|err| {
-        GraphPatchRejectionReason::InvalidPatch {
+        PatchRejectReason::InvalidPatch {
             message: err.to_string(),
         }
     })?;
     let patch_seq = value
         .get("patch_seq")
         .and_then(|value| value.as_u64())
-        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+        .ok_or_else(|| PatchRejectReason::InvalidPatch {
             message: "patch_seq is missing or not an integer".to_string(),
         })?;
     let stage_id = value
         .get("stage_id")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+        .ok_or_else(|| PatchRejectReason::InvalidPatch {
             message: "stage_id is missing or not a string".to_string(),
         })?
         .to_string();
     let ops = value
         .get("ops")
         .and_then(|value| value.as_array())
-        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+        .ok_or_else(|| PatchRejectReason::InvalidPatch {
             message: "ops is missing or not an array".to_string(),
         })?;
 
@@ -251,26 +193,26 @@ fn parse_graph_patch_metadata(
         let node = op
             .get("node_added")
             .and_then(|value| value.get("node"))
-            .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+            .ok_or_else(|| PatchRejectReason::InvalidPatch {
                 message: "node_added.node is missing".to_string(),
             })?;
         let kind = node
             .get("kind")
             .and_then(|value| value.as_str())
-            .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+            .ok_or_else(|| PatchRejectReason::InvalidPatch {
                 message: "node_added.node.kind is missing".to_string(),
             })?;
         node_kinds.push(kind.to_string());
         let exec = node
             .get("exec")
-            .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+            .ok_or_else(|| PatchRejectReason::InvalidPatch {
                 message: "node_added.node.exec is missing".to_string(),
             })?;
         if let Some(tool) = exec.get("tool") {
             let side_effect = tool
                 .get("side_effect")
                 .and_then(|value| value.as_str())
-                .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                .ok_or_else(|| PatchRejectReason::InvalidPatch {
                     message: "tool.side_effect is missing".to_string(),
                 })?;
             if side_effect != "NONE" {
@@ -279,10 +221,7 @@ fn parse_graph_patch_metadata(
                     .and_then(|value| value.as_str())
                     .filter(|value| !value.is_empty());
                 if idempotency_key.is_none() {
-                    return Err(GraphPatchRejectionReason::InvalidPatch {
-                        message: "tool.idempotency_key is required when side_effect != NONE"
-                            .to_string(),
-                    });
+                    return Err(PatchRejectReason::IdempotencyRequired);
                 }
             }
         }
@@ -299,16 +238,16 @@ fn parse_graph_patch_metadata(
 fn parse_stage_touch(
     patch: &CanonicalJsonDocument,
     active_stage_id: &str,
-) -> Result<StageTouch, GraphPatchRejectionReason> {
+) -> Result<StageTouch, PatchRejectReason> {
     let value: Value = serde_json::from_slice(&patch.canonical_json_utf8).map_err(|err| {
-        GraphPatchRejectionReason::InvalidPatch {
+        PatchRejectReason::InvalidPatch {
             message: err.to_string(),
         }
     })?;
     let ops = value
         .get("ops")
         .and_then(|value| value.as_array())
-        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+        .ok_or_else(|| PatchRejectReason::InvalidPatch {
             message: "ops is missing or not an array".to_string(),
         })?;
     for op in ops {
@@ -320,7 +259,7 @@ fn parse_stage_touch(
                     .and_then(|value| value.get("node"))
                     .and_then(|value| value.get("node_id"))
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                    .ok_or_else(|| PatchRejectReason::InvalidPatch {
                         message: "node_added.node.node_id is missing".to_string(),
                     })?;
                 if node_stage_id(node_id) == Some(active_stage_id) {
@@ -330,21 +269,21 @@ fn parse_stage_touch(
                 }
             }
             Some("EDGE_ADDED") => {
-                let edge = op.get("edge_added").ok_or_else(|| {
-                    GraphPatchRejectionReason::InvalidPatch {
+                let edge = op
+                    .get("edge_added")
+                    .ok_or_else(|| PatchRejectReason::InvalidPatch {
                         message: "edge_added is missing".to_string(),
-                    }
-                })?;
+                    })?;
                 let from = edge
                     .get("from")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                    .ok_or_else(|| PatchRejectReason::InvalidPatch {
                         message: "edge_added.from is missing".to_string(),
                     })?;
                 let to = edge
                     .get("to")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                    .ok_or_else(|| PatchRejectReason::InvalidPatch {
                         message: "edge_added.to is missing".to_string(),
                     })?;
                 if node_stage_id(from) == Some(active_stage_id)
@@ -358,20 +297,20 @@ fn parse_stage_touch(
             Some("STATE_PUT") => {
                 let state_put =
                     op.get("state_put")
-                        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                        .ok_or_else(|| PatchRejectReason::InvalidPatch {
                             message: "state_put is missing".to_string(),
                         })?;
                 let scope = state_put
                     .get("scope")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                    .ok_or_else(|| PatchRejectReason::InvalidPatch {
                         message: "state_put.scope is missing".to_string(),
                     })?;
                 if scope == "STAGE" {
                     let stage_id = state_put
                         .get("stage_id")
                         .and_then(|value| value.as_str())
-                        .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                        .ok_or_else(|| PatchRejectReason::InvalidPatch {
                             message: "state_put.stage_id is missing".to_string(),
                         })?;
                     if stage_id == active_stage_id {
@@ -386,7 +325,7 @@ fn parse_stage_touch(
                     .get("node_updated")
                     .and_then(|value| value.get("node_id"))
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| GraphPatchRejectionReason::InvalidPatch {
+                    .ok_or_else(|| PatchRejectReason::InvalidPatch {
                         message: "node_updated.node_id is missing".to_string(),
                     })?;
                 if node_stage_id(node_id) == Some(active_stage_id) {
@@ -396,12 +335,12 @@ fn parse_stage_touch(
                 }
             }
             Some(other) => {
-                return Err(GraphPatchRejectionReason::InvalidPatch {
+                return Err(PatchRejectReason::InvalidPatch {
                     message: format!("unsupported op_type {other}"),
                 });
             }
             None => {
-                return Err(GraphPatchRejectionReason::InvalidPatch {
+                return Err(PatchRejectReason::InvalidPatch {
                     message: "op_type is missing".to_string(),
                 });
             }
@@ -412,10 +351,10 @@ fn parse_stage_touch(
     })
 }
 
-fn reject_response(reason: GraphPatchRejectionReason) -> ApplyGraphPatchResponse {
+fn reject_response(reason: PatchRejectReason) -> ApplyGraphPatchResponse {
     ApplyGraphPatchResponse {
         accepted: false,
-        rejection_reason: reason.message(),
+        rejection_reason: reason.to_string(),
     }
 }
 
@@ -535,7 +474,7 @@ impl CorkCore for CorkCoreService {
             .ok_or_else(|| Status::invalid_argument("missing patch"))?;
         let verification = verify_canonical_sha256(&patch).map_err(|status| *status)?;
         if let Sha256Verification::Mismatch { expected, provided } = verification {
-            let rejection_reason = GraphPatchRejectionReason::Sha256Mismatch {
+            let rejection_reason = PatchRejectReason::Sha256Mismatch {
                 expected: bytes_to_hex(&expected),
                 provided: bytes_to_hex(&provided),
             };
@@ -547,7 +486,7 @@ impl CorkCore for CorkCoreService {
         };
         if run_ctx.active_stage_id().as_deref() != Some(&metadata.stage_id) {
             return Ok(Response::new(reject_response(
-                GraphPatchRejectionReason::StageNotActive {
+                PatchRejectReason::StageNotActive {
                     active_stage_id: run_ctx.active_stage_id(),
                     provided_stage_id: metadata.stage_id,
                 },
@@ -555,12 +494,12 @@ impl CorkCore for CorkCoreService {
         }
         let Some(expansion_policy) = run_ctx.active_stage_expansion_policy() else {
             return Ok(Response::new(reject_response(
-                GraphPatchRejectionReason::MissingExpansionPolicy,
+                PatchRejectReason::ExpansionPolicyMissing,
             )));
         };
         if metadata.has_node_added && !expansion_policy.allow_dynamic {
             return Ok(Response::new(reject_response(
-                GraphPatchRejectionReason::DynamicNodesNotAllowed,
+                PatchRejectReason::DynamicNodesNotAllowed,
             )));
         }
         if metadata.has_node_added {
@@ -571,14 +510,14 @@ impl CorkCore for CorkCoreService {
                     .any(|allowed| allowed == &kind)
                 {
                     return Ok(Response::new(reject_response(
-                        GraphPatchRejectionReason::NodeKindNotAllowed { kind },
+                        PatchRejectReason::KindNotAllowed { kind },
                     )));
                 }
             }
         }
         if let Err(expected) = run_ctx.check_patch_seq(metadata.patch_seq) {
             return Ok(Response::new(reject_response(
-                GraphPatchRejectionReason::PatchSeqMismatch {
+                PatchRejectReason::PatchSeqGap {
                     expected,
                     provided: metadata.patch_seq,
                 },
@@ -594,18 +533,14 @@ impl CorkCore for CorkCoreService {
             self.graph_store.as_ref(),
             self.state_store.as_ref(),
         ) {
-            return Ok(Response::new(reject_response(
-                GraphPatchRejectionReason::InvalidPatch {
-                    message: err.message(),
-                },
-            )));
+            return Ok(Response::new(reject_response(err.reject_reason())));
         }
         if let Err(err) =
             self.patch_store
                 .append_patch(run_ctx.run_id(), metadata.patch_seq, patch.clone())
         {
             return Ok(Response::new(reject_response(
-                GraphPatchRejectionReason::InvalidPatch {
+                PatchRejectReason::InvalidPatch {
                     message: format!("patch store error: {err:?}"),
                 },
             )));
@@ -1011,7 +946,7 @@ mod tests {
             .into_inner();
         assert!(!response.accepted);
         assert!(
-            response.rejection_reason.contains("patch_seq mismatch"),
+            response.rejection_reason.contains("patch_seq gap"),
             "unexpected rejection reason: {}",
             response.rejection_reason
         );
@@ -1035,7 +970,7 @@ mod tests {
             .into_inner();
         assert!(!response.accepted);
         assert!(
-            response.rejection_reason.contains("stage_id not active"),
+            response.rejection_reason.contains("stage not active"),
             "unexpected rejection reason: {}",
             response.rejection_reason
         );
@@ -1087,7 +1022,9 @@ mod tests {
             .into_inner();
         assert!(!response.accepted);
         assert!(
-            response.rejection_reason.contains("idempotency_key"),
+            response
+                .rejection_reason
+                .contains("idempotency_key required"),
             "unexpected rejection reason: {}",
             response.rejection_reason
         );
@@ -1119,6 +1056,98 @@ mod tests {
             response.rejection_reason
         );
         assert!(response.rejection_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_invalid_json_pointer() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch = build_patch_document(
+            &handle.run_id,
+            0,
+            "stage-a",
+            json!([state_put_op("RUN", None, "invalid", json!(1))]),
+        );
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("invalid json pointer"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_unknown_node_id() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch = build_patch_document(
+            &handle.run_id,
+            0,
+            "stage-a",
+            json!([
+                node_added_op_with_id("node-a", "LLM"),
+                edge_added_op("node-a", "node-missing")
+            ]),
+        );
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("unknown node_id"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_rejects_cycle_detected() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0);
+        let patch = build_patch_document(
+            &handle.run_id,
+            0,
+            "stage-a",
+            json!([
+                node_added_op_with_id("node-a", "LLM"),
+                node_added_op_with_id("node-b", "LLM"),
+                edge_added_op("node-a", "node-b"),
+                edge_added_op("node-b", "node-a")
+            ]),
+        );
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!response.accepted);
+        assert!(
+            response.rejection_reason.contains("cycle detected"),
+            "unexpected rejection reason: {}",
+            response.rejection_reason
+        );
     }
 
     #[tokio::test]
