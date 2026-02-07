@@ -107,6 +107,14 @@ CORKは相互運用性を確保するため、以下の規格・概念を採用�
 2. **Precedence（部分順序）**: Node依存エッジ（HTNの≺）
 3. **Resource feasibility（資源制約）**: 機械/CPU/IO/Providerなど容量・排他
 
+### 4.4 Contract defaults の適用順序
+- Contract Manifestのdefaultsは、Stageが省略した設定を補うために使う。
+- **expansion_policyの優先順位**:
+  1. `stage.expansion_policy` が存在する場合はそれを採用
+  2. 無い場合は `defaults.expansion_policy` を採用
+- 両方に `expansion_policy` が無い場合は契約不備として拒否する。
+- 将来の拡張に備え、`defaults` と `stage` のマージは「stageが上書きする」前提で定義する。
+
 ---
 
 ## 5. ID・順序・再現性

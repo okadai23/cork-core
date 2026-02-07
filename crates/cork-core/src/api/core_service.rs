@@ -160,26 +160,50 @@ fn parse_expansion_policy(
                 "active stage is missing in contract",
             ))
         })?;
-    let expansion = stage.get("expansion_policy").ok_or_else(|| {
-        Box::new(Status::invalid_argument(
-            "stage expansion_policy is missing in contract",
-        ))
-    })?;
+    let defaults_expansion = contract
+        .get("defaults")
+        .and_then(|defaults| defaults.get("expansion_policy"));
+    let stage_expansion = stage.get("expansion_policy");
+    let expansion =
+        merge_expansion_policy(stage_expansion, defaults_expansion).ok_or_else(|| {
+            Box::new(Status::invalid_argument(
+                "expansion_policy is missing in stage and defaults",
+            ))
+        })?;
+    let location = if stage_expansion.is_some() {
+        "stage expansion_policy"
+    } else {
+        "defaults expansion_policy"
+    };
+    parse_expansion_policy_value(expansion, location)
+}
+
+fn merge_expansion_policy<'a>(
+    stage: Option<&'a Value>,
+    defaults: Option<&'a Value>,
+) -> Option<&'a Value> {
+    stage.or(defaults)
+}
+
+fn parse_expansion_policy_value(
+    expansion: &Value,
+    location: &str,
+) -> Result<cork_store::ExpansionPolicy, Box<Status>> {
     let allow_dynamic = expansion
         .get("allow_dynamic")
         .and_then(|value| value.as_bool())
         .ok_or_else(|| {
-            Box::new(Status::invalid_argument(
-                "expansion_policy.allow_dynamic is missing",
-            ))
+            Box::new(Status::invalid_argument(format!(
+                "{location}.allow_dynamic is missing"
+            )))
         })?;
     let allow_kinds = expansion
         .get("allow_kinds")
         .and_then(|value| value.as_array())
         .ok_or_else(|| {
-            Box::new(Status::invalid_argument(
-                "expansion_policy.allow_kinds is missing",
-            ))
+            Box::new(Status::invalid_argument(format!(
+                "{location}.allow_kinds is missing"
+            )))
         })?
         .iter()
         .map(|value| {
@@ -826,6 +850,21 @@ mod tests {
         let payload = json!({
             "schema_version": "cork.contract_manifest.v0.1",
             "manifest_id": "manifest-1",
+            "defaults": {
+                "expansion_policy": {
+                    "allow_dynamic": false,
+                    "allow_kinds": ["LLM"],
+                    "max_dynamic_nodes": 0,
+                    "max_steps_in_stage": 1,
+                    "allow_cross_stage_deps": "NONE"
+                },
+                "stage_budget": {},
+                "stage_ttl": {},
+                "completion_policy": {
+                    "fail_on_any_failure": false,
+                    "require_commit": true
+                }
+            },
             "contract_graph": {
                 "stages": [
                     {
@@ -848,6 +887,58 @@ mod tests {
             sha256: Some(build_sha256(&digest)),
             schema_id: "cork.contract_manifest.v0.1".to_string(),
         }
+    }
+
+    #[test]
+    fn parse_expansion_policy_uses_defaults_when_stage_missing() {
+        let contract = json!({
+            "schema_version": "cork.contract_manifest.v0.1",
+            "manifest_id": "manifest-1",
+            "defaults": {
+                "expansion_policy": {
+                    "allow_dynamic": true,
+                    "allow_kinds": ["TOOL", "LLM"],
+                    "max_dynamic_nodes": 0,
+                    "max_steps_in_stage": 1,
+                    "allow_cross_stage_deps": "NONE"
+                },
+                "stage_budget": {},
+                "stage_ttl": {},
+                "completion_policy": {
+                    "fail_on_any_failure": false,
+                    "require_commit": true
+                }
+            },
+            "contract_graph": {
+                "stages": [
+                    { "stage_id": "stage-a" }
+                ]
+            }
+        });
+        let policy = parse_expansion_policy(&contract, "stage-a").expect("defaults policy");
+        assert!(policy.allow_dynamic);
+        assert_eq!(
+            policy.allow_kinds,
+            vec!["TOOL".to_string(), "LLM".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_expansion_policy_rejects_when_missing_in_stage_and_defaults() {
+        let contract = json!({
+            "schema_version": "cork.contract_manifest.v0.1",
+            "manifest_id": "manifest-1",
+            "contract_graph": {
+                "stages": [
+                    { "stage_id": "stage-a" }
+                ]
+            }
+        });
+        let err = parse_expansion_policy(&contract, "stage-a").expect_err("missing policy");
+        assert_eq!(
+            err.message(),
+            "expansion_policy is missing in stage and defaults"
+        );
     }
 
     fn node_added_op(kind: &str) -> Value {

@@ -1265,9 +1265,9 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 # P0: Spec Correctness / 破綻防止（最優先）
 
-## [ ] CORE-100: expansion_policy の defaults フォールバック/マージ対応（Spec整合）
-**Priority:** P0  
-**Type:** Bugfix / Spec compliance  
+## [x] CORE-100: expansion_policy の defaults フォールバック/マージ対応（Spec整合）
+**Priority:** P0
+**Type:** Bugfix / Spec compliance
 **Depends on:** 既存 SubmitRun 実装
 
 **Goal**
@@ -1280,20 +1280,20 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - 「defaults + stage override」のマージルールを明文化（allow_kindsの扱い等）
 
 **Subtasks**
-- [ ] `parse_expansion_policy` を修正し、stage->defaults の順で解決
-- [ ] マージルールを実装（最低限: stageが存在する場合はstageを採用、将来に備えて merge 関数を分離）
-- [ ] contract schema の該当箇所（defaults の定義）と整合を再確認
-- [ ] ユニットテスト追加:
-  - [ ] stage省略 + defaultsあり => OK
-  - [ ] stage省略 + defaultsなし => Reject（reason明確化）
-- [ ] E2E統合テストに defaults 省略ケースを追加（既存 minimal を置換 or 追加）
+- [x] `parse_expansion_policy` を修正し、stage->defaults の順で解決
+- [x] マージルールを実装（最低限: stageが存在する場合はstageを採用、将来に備えて merge 関数を分離）
+- [x] contract schema の該当箇所（defaults の定義）と整合を再確認
+- [x] ユニットテスト追加:
+  - [x] stage省略 + defaultsあり => OK
+  - [x] stage省略 + defaultsなし => Reject（reason明確化）
+- [x] E2E統合テストに defaults 省略ケースを追加（既存 minimal を置換 or 追加）
 
 **DoD**
 - テストで上記ケースが固定化され、今後の回帰を防ぐ
 - 拒否時のエラーが「何が足りないか」特定できる
 
 **Acceptance Criteria**
-- stage側 expansion_policy 省略の contract を SubmitRun が受理し、Run が開始できる
+- [x] stage側 expansion_policy 省略の contract を SubmitRun が受理し、Run が開始できる
 
 **Tests**
 - unit: `parse_expansion_policy_*`
@@ -1302,12 +1302,20 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 **Docs**
 - docs/specification.md の該当章に「defaults適用順序」を追記
 
+### 進捗
+- [DONE] defaults優先度のパース/マージを追加し、欠落時のエラーメッセージを明確化。
+  - 変更ファイル: `crates/cork-core/src/api/core_service.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] defaults適用順序を仕様書に追記し、defaults-onlyのE2E/ユニットテストを追加。
+  - 変更ファイル: `docs/specification.md`, `crates/cork-core/tests/e2e_minimal.rs`, `crates/cork-core/src/api/core_service.rs`。
+  - 検証: `make test`。
+
 
 ---
 
 ## [ ] CORE-101: async コンテキストの `std::sync::{Mutex,RwLock}` を排除（Tokioでブロックしない）
-**Priority:** P0  
-**Type:** Perf / Stability  
+**Priority:** P0
+**Type:** Perf / Stability
 **Depends on:** なし（独立、ただし広範囲変更）
 
 **Goal**
@@ -1343,8 +1351,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-103: ApplyGraphPatch の完全原子性（partial applyを絶対に起こさない）
-**Priority:** P0  
-**Type:** Correctness / Data integrity  
+**Priority:** P0
+**Type:** Correctness / Data integrity
 **Depends on:** CORE-101（推奨：ロック整理後の方が安全）
 
 **Goal**
@@ -1383,8 +1391,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-102: SubmitRun で policy をストアへ保存し、取得可能にする（実験管理の土台）
-**Priority:** P0  
-**Type:** Correctness / Experiment reproducibility  
+**Priority:** P0
+**Type:** Correctness / Experiment reproducibility
 **Depends on:** CORE-103（推奨：整合性ルールが固まってから）
 
 **Goal**
@@ -1415,8 +1423,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-112: StreamRunEvents / GetLogs の backpressure & retention（OOM防止）
-**Priority:** P0  
-**Type:** Stability / Availability  
+**Priority:** P0
+**Type:** Stability / Availability
 **Depends on:** CORE-101（推奨）
 
 **Goal**
@@ -1449,8 +1457,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-150: 入力サイズ制限・クォータ（巨大JSON/巨大patchで落ちない）
-**Priority:** P0  
-**Type:** Security / Stability  
+**Priority:** P0
+**Type:** Security / Stability
 **Depends on:** CORE-103
 
 **Goal**
@@ -1480,8 +1488,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 # P1: 運用耐性（長時間実行 / 失敗が日常の環境）
 
 ## [ ] CORE-111: watchdog（TTL / idle / patch嵐 / 無限ループ検知）
-**Priority:** P1  
-**Type:** Availability  
+**Priority:** P1
+**Type:** Availability
 **Depends on:** CORE-112（推奨：ログ過多対策と相性）
 
 **Goal**
@@ -1511,8 +1519,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-113: Worker呼び出しの resilience（timeout / retry / backoff / circuit breaker）
-**Priority:** P1  
-**Type:** Reliability  
+**Priority:** P1
+**Type:** Reliability
 **Depends on:** CORE-101
 
 **Goal**
@@ -1541,8 +1549,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-141: graceful shutdown（drain / flush / consistency）
-**Priority:** P1  
-**Type:** Ops readiness  
+**Priority:** P1
+**Type:** Ops readiness
 **Depends on:** CORE-103, CORE-112
 
 **Goal**
@@ -1570,8 +1578,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-110: 永続ストア（SQLite等）/ 再起動復元（実験管理の実体化）
-**Priority:** P1  
-**Type:** Durability  
+**Priority:** P1
+**Type:** Durability
 **Depends on:** CORE-103, CORE-141
 
 **Goal**
@@ -1601,8 +1609,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 # P1: 観測性 / 利用可能性
 
 ## [ ] CORE-120: structured tracing + metrics（run_id/scope_id/patch_seq を相関IDに）
-**Priority:** P1  
-**Type:** Observability  
+**Priority:** P1
+**Type:** Observability
 **Depends on:** CORE-101
 
 **Goal**
@@ -1630,8 +1638,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 # P2: 将来の最適化（Job-shop / SHOP3）に向けた下地
 
 ## [ ] CORE-130: Graphの制約メタデータ拡張（Job-shop / HTN 将来対応のための保存層）
-**Priority:** P2  
-**Type:** Future-proofing  
+**Priority:** P2
+**Type:** Future-proofing
 **Depends on:** CORE-103
 
 **Goal**
@@ -1664,8 +1672,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 # P2: テスト強化（壊れないことの担保）
 
 ## [ ] CORE-143: Spec conformance test suite（仕様準拠を自動で証明）
-**Priority:** P2  
-**Type:** Quality  
+**Priority:** P2
+**Type:** Quality
 **Depends on:** CORE-100, CORE-103
 
 **Goal**
@@ -1694,8 +1702,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 ---
 
 ## [ ] CORE-152: fuzz / property tests（Patch/JSON入力の堅牢性）
-**Priority:** P2  
-**Type:** Security / Robustness  
+**Priority:** P2
+**Type:** Security / Robustness
 **Depends on:** CORE-150
 
 **Goal**
