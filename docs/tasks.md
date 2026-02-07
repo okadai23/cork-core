@@ -1103,11 +1103,11 @@ CORE-040 まで
 
 ### サブタスク
 
-- [ ] テストWorker stubを立てる（同一プロセスでtonic server起動）
-- [ ] SubmitRun（小さいContract：stage1→stage2）
-- [ ] stage1に patch_seq=0 をApply（NODE_ADDED tool）
-- [ ] tool完了→stage auto-commit→stage2へ
-- [ ] StreamRunEvents を購読し、期待イベント列を検証
+- [x] テストWorker stubを立てる（同一プロセスでtonic server起動）
+- [x] SubmitRun（小さいContract：stage1→stage2）
+- [x] stage1に patch_seq=0 をApply（NODE_ADDED tool）
+- [x] tool完了→stage auto-commit→stage2へ
+- [x] StreamRunEvents を購読し、期待イベント列を検証
 
 ### DoD
 
@@ -1115,10 +1115,16 @@ CORE-040 まで
 
 ### Acceptance Criteria
 
-- [ ] Runが RUN_SUCCEEDED まで到達
-- [ ] event_seqが連続である
-- [ ] composite_hashが安定
-- [ ] GetLogsで scope 単位ログが取れる
+- [x] Runが RUN_SUCCEEDED まで到達
+- [x] event_seqが連続である
+- [x] composite_hashが安定
+- [x] GetLogsで scope 単位ログが取れる
+
+### 進捗
+
+- [DONE] e2e最小フローの統合テストを追加し、SubmitRun→Patch→Worker実行→auto-commit→完了を検証。
+  - 変更ファイル: `crates/cork-core/tests/e2e_minimal.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 ---
 

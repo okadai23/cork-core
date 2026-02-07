@@ -8,15 +8,15 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::patch::{PatchRejectReason, apply_graph_patch_ops};
-use crate::engine::run::node_stage_id;
-use cork_hash::{composite_graph_hash, contract_hash, patch_hash, sha256};
+use crate::engine::run::{node_stage_id, validate_contract_manifest, validate_policy};
+use cork_hash::{composite_graph_hash, contract_hash, patch_hash, policy_hash, sha256};
 use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
     ApplyGraphPatchRequest, ApplyGraphPatchResponse, CancelRunRequest, CancelRunResponse,
     CanonicalJsonDocument, GetCompositeGraphRequest, GetCompositeGraphResponse, GetLogsRequest,
     GetLogsResponse, GetRunRequest, GetRunResponse, HashBundle, ListRunsRequest, ListRunsResponse,
-    RunEvent, Sha256, StreamRunEventsRequest, SubmitRunRequest, SubmitRunResponse,
-    cork_core_server::CorkCore,
+    RunEvent, RunHandle, RunStatus, Sha256, StreamRunEventsRequest, SubmitRunRequest,
+    SubmitRunResponse, cork_core_server::CorkCore,
 };
 use cork_store::{
     CreateRunInput, EventLog, InMemoryEventLog, InMemoryGraphStore, InMemoryLogStore,
@@ -62,7 +62,7 @@ impl CorkCoreService {
         self.run_registry.create_run(input)
     }
 
-    fn event_log_for_run(&self, run_id: &str) -> Arc<InMemoryEventLog> {
+    pub fn event_log_for_run(&self, run_id: &str) -> Arc<InMemoryEventLog> {
         let mut logs = self
             .event_logs
             .write()
@@ -70,6 +70,18 @@ impl CorkCoreService {
         logs.entry(run_id.to_string())
             .or_insert_with(|| Arc::new(InMemoryEventLog::new()))
             .clone()
+    }
+
+    pub fn graph_store(&self) -> Arc<InMemoryGraphStore> {
+        Arc::clone(&self.graph_store)
+    }
+
+    pub fn log_store(&self) -> Arc<InMemoryLogStore> {
+        Arc::clone(&self.log_store)
+    }
+
+    pub fn state_store(&self) -> Arc<InMemoryStateStore> {
+        Arc::clone(&self.state_store)
     }
 }
 
@@ -129,6 +141,57 @@ fn bytes_to_sha256(bytes: &[u8; 32]) -> Sha256 {
     Sha256 {
         bytes32: bytes.to_vec(),
     }
+}
+
+fn parse_expansion_policy(
+    contract: &Value,
+    stage_id: &str,
+) -> Result<cork_store::ExpansionPolicy, Box<Status>> {
+    let stages = contract
+        .get("contract_graph")
+        .and_then(|graph| graph.get("stages"))
+        .and_then(|stages| stages.as_array())
+        .ok_or_else(|| Box::new(Status::invalid_argument("contract_graph.stages is missing")))?;
+    let stage = stages
+        .iter()
+        .find(|stage| stage.get("stage_id").and_then(|value| value.as_str()) == Some(stage_id))
+        .ok_or_else(|| {
+            Box::new(Status::invalid_argument(
+                "active stage is missing in contract",
+            ))
+        })?;
+    let expansion = stage.get("expansion_policy").ok_or_else(|| {
+        Box::new(Status::invalid_argument(
+            "stage expansion_policy is missing in contract",
+        ))
+    })?;
+    let allow_dynamic = expansion
+        .get("allow_dynamic")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            Box::new(Status::invalid_argument(
+                "expansion_policy.allow_dynamic is missing",
+            ))
+        })?;
+    let allow_kinds = expansion
+        .get("allow_kinds")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            Box::new(Status::invalid_argument(
+                "expansion_policy.allow_kinds is missing",
+            ))
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                Box::new(Status::invalid_argument("allow_kinds contains non-string"))
+            })
+        })
+        .collect::<Result<Vec<String>, Box<Status>>>()?;
+    Ok(cork_store::ExpansionPolicy {
+        allow_dynamic,
+        allow_kinds,
+    })
 }
 
 fn verify_canonical_sha256(doc: &CanonicalJsonDocument) -> Result<Sha256Verification, Box<Status>> {
@@ -379,7 +442,64 @@ impl CorkCore for CorkCoreService {
         {
             return Err(Status::invalid_argument("policy sha256 mismatch"));
         }
-        Err(Status::unimplemented("SubmitRun not yet implemented"))
+        let contract = request
+            .contract_manifest
+            .ok_or_else(|| Status::invalid_argument("missing contract_manifest"))?;
+        let policy = request
+            .policy
+            .ok_or_else(|| Status::invalid_argument("missing policy"))?;
+        let contract_json: Value = serde_json::from_slice(&contract.canonical_json_utf8)
+            .map_err(|err| Status::invalid_argument(format!("invalid contract json: {err}")))?;
+        let policy_json: Value = serde_json::from_slice(&policy.canonical_json_utf8)
+            .map_err(|err| Status::invalid_argument(format!("invalid policy json: {err}")))?;
+        let validated_contract = validate_contract_manifest(&contract_json)
+            .map_err(|err| Status::invalid_argument(format!("contract manifest error: {err:?}")))?;
+        let validated_policy = validate_policy(&policy_json)
+            .map_err(|err| Status::invalid_argument(format!("policy error: {err:?}")))?;
+        let active_stage_id = validated_contract
+            .stage_order
+            .first()
+            .ok_or_else(|| Status::invalid_argument("contract stages are missing"))?;
+        let expansion_policy =
+            parse_expansion_policy(&contract_json, active_stage_id).map_err(|status| *status)?;
+        let contract_digest = contract_hash(&contract.canonical_json_utf8);
+        let policy_digest = policy_hash(&policy.canonical_json_utf8);
+        let hash_bundle = HashBundle {
+            contract_manifest_hash: Some(bytes_to_sha256(&contract_digest)),
+            policy_hash: Some(bytes_to_sha256(&policy_digest)),
+            run_config_hash: None,
+            composite_graph_hash: None,
+        };
+        let now = SystemTime::now();
+        let run_ctx = self.run_registry.create_run(CreateRunInput {
+            experiment_id: if request.experiment_id.is_empty() {
+                None
+            } else {
+                Some(request.experiment_id)
+            },
+            variant_id: if request.variant_id.is_empty() {
+                None
+            } else {
+                Some(request.variant_id)
+            },
+            status: Some(RunStatus::RunRunning),
+            hash_bundle: Some(hash_bundle.clone()),
+            stage_auto_commit: Some(validated_policy.stage_auto_commit),
+            next_patch_seq: Some(0),
+            active_stage_id: Some(active_stage_id.to_string()),
+            active_stage_expansion_policy: Some(expansion_policy),
+            stage_started_at: Some(now),
+            last_patch_at: Some(now),
+        });
+        self.patch_store
+            .set_contract_manifest(run_ctx.run_id(), contract);
+        Ok(Response::new(SubmitRunResponse {
+            handle: Some(RunHandle {
+                run_id: run_ctx.run_id().to_string(),
+            }),
+            hashes: Some(hash_bundle),
+            created_at: Some(system_time_to_timestamp(run_ctx.metadata().created_at)),
+        }))
     }
 
     async fn cancel_run(
