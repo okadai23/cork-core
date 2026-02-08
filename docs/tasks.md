@@ -1516,6 +1516,9 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - [DONE] gRPC message size と SubmitRun/ApplyGraphPatch の入力制限を追加し、境界値テストで検証。
   - 変更ファイル: `crates/cork-core/src/api/core_service.rs`, `crates/cork-core/src/engine/patch.rs`, `crates/cork-core/src/main.rs`, `crates/cork-core/src/bin/corkctl.rs`, `crates/cork-core/src/engine/run.rs`, `crates/cork-core/src/worker/client.rs`, `crates/cork-core/tests/e2e_minimal.rs`。
   - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] corkd の gRPC 送信メッセージサイズ上限を解除して、大容量レスポンスが失敗しないように調整。
+  - 変更ファイル: `crates/cork-core/src/main.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 
 ---
