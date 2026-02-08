@@ -35,8 +35,9 @@ use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tonic::{Request, Response, Status};
 
 /// The CorkCore service implementation.
+#[derive(Clone)]
 pub struct CorkCoreService {
-    event_logs: DashMap<String, Arc<InMemoryEventLog>>,
+    event_logs: Arc<DashMap<String, Arc<InMemoryEventLog>>>,
     event_log_config: EventLogConfig,
     graph_store: Arc<InMemoryGraphStore>,
     limits: CorkCoreServiceLimits,
@@ -88,7 +89,7 @@ impl CorkCoreService {
 
     pub fn with_config(config: CorkCoreServiceConfig) -> Self {
         Self {
-            event_logs: DashMap::new(),
+            event_logs: Arc::new(DashMap::new()),
             event_log_config: config.event_log,
             graph_store: Arc::new(InMemoryGraphStore::new()),
             limits: config.limits,
@@ -101,7 +102,7 @@ impl CorkCoreService {
 
     pub fn with_run_registry(run_registry: Arc<dyn RunRegistry>) -> Self {
         Self {
-            event_logs: DashMap::new(),
+            event_logs: Arc::new(DashMap::new()),
             event_log_config: EventLogConfig::default(),
             graph_store: Arc::new(InMemoryGraphStore::new()),
             limits: CorkCoreServiceLimits::default(),
