@@ -399,6 +399,8 @@ dependencies = [
  "base64",
  "cork-proto",
  "dashmap",
+ "prost",
+ "prost-types",
  "serde_json",
  "tokio",
  "uuid",

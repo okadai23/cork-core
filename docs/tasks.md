@@ -1462,10 +1462,10 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - slow subscriber の扱い方針を決める（drop / disconnect / latest-only）
 
 **Subtasks**
-- [ ] `EventLog` の broadcast/backlog を bounded 化（方針決定）
-- [ ] `LogStore` の保持上限（max_records/max_bytes）を config 可能に
-- [ ] `since_event_seq` が retention の外に落ちた場合の扱い:
-  - [ ] エラー（OUT_OF_RANGE） or “最古seqから再開” を仕様化
+- [x] `EventLog` の broadcast/backlog を bounded 化（方針決定）
+- [x] `LogStore` の保持上限（max_records/max_bytes）を config 可能に
+- [x] `since_event_seq` が retention の外に落ちた場合の扱い:
+  - [x] エラー（OUT_OF_RANGE）を仕様化
 - [ ] 負荷テスト（大量ログ + 遅い購読者）
 
 **DoD**
@@ -1477,6 +1477,11 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 **Docs**
 - docs/specification.md に retention/backpressure の仕様を追記
+
+### 進捗
+- [IN PROGRESS] EventLog/LogStore に retention 設定とバックプレッシャー方針を実装。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`, `docs/specification.md`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 
 ---
