@@ -194,6 +194,7 @@ impl WorkerClient {
                 Ok(response) => {
                     let mut stream = response.into_inner();
                     let mut final_response = None;
+                    let mut stream_error = None;
                     while let Some(chunk) = stream.next().await {
                         match chunk {
                             Ok(chunk) => {
@@ -201,15 +202,21 @@ impl WorkerClient {
                                     final_response = Some(action);
                                 }
                             }
-                            Err(status) => return Err(status),
+                            Err(status) => {
+                                stream_error = Some(status);
+                                break;
+                            }
                         }
                     }
-                    let Some(final_response) = final_response else {
-                        return Err(Status::data_loss(
+                    if let Some(status) = stream_error {
+                        Err(status)
+                    } else if let Some(final_response) = final_response {
+                        Ok(final_response)
+                    } else {
+                        Err(Status::data_loss(
                             "invoke tool stream ended without final response",
-                        ));
-                    };
-                    Ok(final_response)
+                        ))
+                    }
                 }
                 Err(status) => Err(status),
             };
@@ -652,8 +659,14 @@ mod tests {
     use super::*;
     use cork_proto::cork::v1::cork_worker_server::{CorkWorker, CorkWorkerServer};
     use cork_proto::cork::v1::{InvokeToolRequest, InvokeToolResponse};
-    use cork_store::{InMemoryEventLog, InMemoryLogStore, InMemoryStateStore, LogStore};
+    use cork_store::{
+        CircuitBreakerPolicy, InMemoryEventLog, InMemoryLogStore, InMemoryStateStore, LogStore,
+        RetryBackoff, RetryBackoffPolicy, RetryJitter, WorkerPolicy, WorkerRetryCondition,
+        WorkerRetryPolicy,
+    };
     use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio_stream::Stream;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -753,6 +766,128 @@ mod tests {
             .await
             .expect("connect");
         (channel, handle)
+    }
+
+    struct FlakyStreamWorker {
+        remaining_failures: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl CorkWorker for FlakyStreamWorker {
+        async fn health(
+            &self,
+            _request: Request<cork_proto::cork::v1::HealthRequest>,
+        ) -> Result<Response<cork_proto::cork::v1::HealthResponse>, Status> {
+            Ok(Response::new(cork_proto::cork::v1::HealthResponse {
+                status: "ok".to_string(),
+                worker_id: "worker-flaky".to_string(),
+            }))
+        }
+
+        async fn invoke_tool(
+            &self,
+            _request: Request<InvokeToolRequest>,
+        ) -> Result<Response<InvokeToolResponse>, Status> {
+            Err(Status::unimplemented("invoke_tool not used"))
+        }
+
+        type InvokeToolStreamStream =
+            Pin<Box<dyn Stream<Item = Result<InvokeToolStreamChunk, Status>> + Send>>;
+
+        async fn invoke_tool_stream(
+            &self,
+            _request: Request<InvokeToolRequest>,
+        ) -> Result<Response<Self::InvokeToolStreamStream>, Status> {
+            let remaining = self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    Some(value.saturating_sub(1))
+                })
+                .unwrap_or(0);
+            if remaining > 0 {
+                let log = LogRecord {
+                    ts: None,
+                    level: "INFO".to_string(),
+                    message: "flaky-log".to_string(),
+                    trace_id_hex: "".to_string(),
+                    span_id_hex: "".to_string(),
+                    scope_id: "".to_string(),
+                    scope_seq: 0,
+                    attrs: Default::default(),
+                };
+                let chunks = vec![
+                    Ok(InvokeToolStreamChunk {
+                        ts: None,
+                        chunk: Some(Chunk::Log(log)),
+                    }),
+                    Err(Status::unavailable("transient stream failure")),
+                ];
+                return Ok(Response::new(Box::pin(tokio_stream::iter(chunks))));
+            }
+            let response = InvokeToolResponse {
+                output: Some(Payload {
+                    content_type: "application/json".to_string(),
+                    data: br#"{"ok":true}"#.to_vec(),
+                    encoding: "".to_string(),
+                    sha256: None,
+                }),
+                artifacts: Vec::new(),
+                error_code: "".to_string(),
+                error_message: "".to_string(),
+            };
+            let chunks = vec![Ok(InvokeToolStreamChunk {
+                ts: None,
+                chunk: Some(Chunk::Final(response)),
+            })];
+            Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+        }
+    }
+
+    async fn start_flaky_server(failures: usize) -> (Channel, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let incoming = TcpListenerStream::new(listener);
+        let worker = FlakyStreamWorker {
+            remaining_failures: Arc::new(AtomicUsize::new(failures)),
+        };
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    CorkWorkerServer::new(worker)
+                        .max_decoding_message_size(crate::api::DEFAULT_GRPC_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(crate::api::DEFAULT_GRPC_MAX_MESSAGE_BYTES),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("channel")
+            .connect()
+            .await
+            .expect("connect");
+        (channel, handle)
+    }
+
+    fn test_retry_policy(max_attempts: u32) -> WorkerPolicy {
+        WorkerPolicy {
+            timeout_ms: Some(1_000),
+            retry: WorkerRetryPolicy {
+                max_attempts,
+                backoff: RetryBackoff {
+                    policy: RetryBackoffPolicy::Constant,
+                    base_delay_ms: 1,
+                    max_delay_ms: 1,
+                    jitter: RetryJitter::None,
+                },
+                retry_on: vec![WorkerRetryCondition::GrpcUnavailable],
+                circuit_breaker: CircuitBreakerPolicy {
+                    enabled: false,
+                    open_after_failures: 3,
+                    half_open_after_ms: 1_000,
+                },
+            },
+        }
     }
 
     #[test]
@@ -895,6 +1030,45 @@ mod tests {
         let page = log_store.list_logs("run-2", None, cork_store::LogFilters::default(), 10);
         assert_eq!(page.logs.len(), 1);
         assert!(page.logs[0].ts.is_some());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn invoke_tool_stream_retries_on_stream_error() {
+        let (channel, handle) = start_flaky_server(1).await;
+        let mut client = WorkerClient::new(channel);
+        let event_log = InMemoryEventLog::new();
+        let log_store = InMemoryLogStore::new();
+        let state_store = InMemoryStateStore::new();
+        let context = InvocationContext {
+            run_id: "run-3",
+            stage_id: "stage-c",
+            node_id: "stage-c/node-c",
+            run_ctx: None,
+            event_log: &event_log,
+            log_store: &log_store,
+            state_store: &state_store,
+            budget: InvocationBudget::default(),
+            trace_context: None,
+            worker_policy: Some(test_retry_policy(2)),
+        };
+
+        let request = InvokeToolRequest {
+            invocation_id: "inv-3".to_string(),
+            tool_name: "tool".to_string(),
+            tool_version: "v1".to_string(),
+            input: None,
+            deadline: None,
+            idempotency_key: "".to_string(),
+            trace_context: None,
+        };
+
+        let response = client
+            .invoke_tool_stream(request, &context)
+            .await
+            .expect("retry success");
+        assert!(response.output.is_some());
 
         handle.abort();
     }

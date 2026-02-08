@@ -1597,6 +1597,9 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - [DONE] Workerの一時障害/永続障害の統合テストを追加。
   - 変更ファイル: `crates/cork-core/tests/e2e_minimal.rs`。
   - 検証: `make test`。
+- [DONE] ストリーミング中断エラーをretry/breaker経路へ流す修正を追加。
+  - 変更ファイル: `crates/cork-core/src/worker/client.rs`。
+  - 検証: `make test`。
 
 
 ---
