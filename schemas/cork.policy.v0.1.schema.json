@@ -129,6 +129,61 @@
       }
     },
 
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout_ms", "retry"],
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000 },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_attempts", "backoff", "retry_on", "circuit_breaker"],
+          "properties": {
+            "max_attempts": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "backoff": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["policy", "base_delay_ms", "max_delay_ms", "jitter"],
+              "properties": {
+                "policy": { "type": "string", "enum": ["EXPONENTIAL", "LINEAR", "CONSTANT"] },
+                "base_delay_ms": { "type": "integer", "minimum": 0, "maximum": 600000 },
+                "max_delay_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
+                "jitter": { "type": "string", "enum": ["NONE", "FULL", "EQUAL"] }
+              }
+            },
+            "retry_on": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "TIMEOUT",
+                  "TRANSIENT_NETWORK",
+                  "GRPC_UNAVAILABLE",
+                  "GRPC_DEADLINE_EXCEEDED",
+                  "GRPC_RESOURCE_EXHAUSTED",
+                  "GRPC_ABORTED",
+                  "GRPC_CANCELLED",
+                  "GRPC_UNKNOWN",
+                  "GRPC_INTERNAL"
+                ]
+              }
+            },
+            "circuit_breaker": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["enabled", "open_after_failures", "half_open_after_ms"],
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "open_after_failures": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "half_open_after_ms": { "type": "integer", "minimum": 100, "maximum": 3600000 }
+              }
+            }
+          }
+        }
+      }
+    },
+
     "rate_limit": {
       "type": "object",
       "additionalProperties": false,

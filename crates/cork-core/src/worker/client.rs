@@ -5,9 +5,13 @@ use cork_proto::cork::v1::invoke_tool_stream_chunk::Chunk;
 use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
     ArtifactRef as ProtoArtifactRef, InvokeToolRequest, InvokeToolResponse, InvokeToolStreamChunk,
-    LogRecord, NodeStateChanged, NodeStatus, Payload, RunEvent, TraceContext,
+    LogRecord, NodeStateChanged, NodeStatus, Payload, PolicyEvent, RunEvent, TraceContext,
 };
-use cork_store::{ArtifactRef, EventLog, LogStore, NodeOutput, NodePayload, RunCtx, StateStore};
+use cork_store::{
+    ArtifactRef, CircuitBreakerPolicy, EventLog, LogStore, NodeOutput, NodePayload, RetryBackoff,
+    RetryBackoffPolicy, RetryJitter, RunCtx, StateStore, WorkerPolicy, WorkerRetryCondition,
+    WorkerRetryPolicy,
+};
 use prost_types::Timestamp;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
@@ -55,21 +59,27 @@ pub struct InvocationContext<'a> {
     pub state_store: &'a dyn StateStore,
     pub budget: InvocationBudget,
     pub trace_context: Option<TraceContext>,
+    pub worker_policy: Option<WorkerPolicy>,
 }
 
 pub struct WorkerClient {
     client: CorkWorkerClient<Channel>,
+    circuit_breaker: CircuitBreakerState,
 }
 
 impl WorkerClient {
     pub fn new(channel: Channel) -> Self {
         Self {
             client: CorkWorkerClient::new(channel),
+            circuit_breaker: CircuitBreakerState::Closed { failures: 0 },
         }
     }
 
     pub fn from_client(client: CorkWorkerClient<Channel>) -> Self {
-        Self { client }
+        Self {
+            client,
+            circuit_breaker: CircuitBreakerState::Closed { failures: 0 },
+        }
     }
 
     pub async fn invoke_tool(
@@ -77,10 +87,9 @@ impl WorkerClient {
         request: InvokeToolRequest,
         context: &InvocationContext<'_>,
     ) -> Result<InvokeToolResponse, Status> {
-        let request = build_request(request, context);
-        match self.client.invoke_tool(request).await {
+        let result = self.invoke_tool_with_retry(request, context).await;
+        match result {
             Ok(response) => {
-                let response = response.into_inner();
                 handle_success(context, &response).await;
                 Ok(response)
             }
@@ -96,38 +105,131 @@ impl WorkerClient {
         request: InvokeToolRequest,
         context: &InvocationContext<'_>,
     ) -> Result<InvokeToolResponse, Status> {
-        let request = build_request(request, context);
-        let mut stream = match self.client.invoke_tool_stream(request).await {
-            Ok(response) => response.into_inner(),
+        let result = self.invoke_tool_stream_with_retry(request, context).await;
+        match result {
+            Ok(response) => {
+                handle_success(context, &response).await;
+                Ok(response)
+            }
             Err(status) => {
                 handle_failure(context, &status).await;
+                Err(status)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CircuitBreakerState {
+    Closed { failures: u32 },
+    Open { open_until: SystemTime },
+    HalfOpen,
+}
+
+impl CircuitBreakerState {}
+
+enum CircuitDecision {
+    Allow,
+    FailFast(Status),
+}
+
+impl WorkerClient {
+    async fn invoke_tool_with_retry(
+        &mut self,
+        request: InvokeToolRequest,
+        context: &InvocationContext<'_>,
+    ) -> Result<InvokeToolResponse, Status> {
+        let policy = context.worker_policy.as_ref().cloned().unwrap_or_default();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let decision = self
+                .circuit_allow(&policy.retry.circuit_breaker, context)
+                .await;
+            if let CircuitDecision::FailFast(status) = decision {
                 return Err(status);
             }
-        };
-
-        let mut final_response = None;
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    if let Some(action) = handle_chunk(context, &chunk).await {
-                        final_response = Some(action);
-                    }
+            let request = build_request(request.clone(), context);
+            let result = self
+                .client
+                .invoke_tool(request)
+                .await
+                .map(|response| response.into_inner());
+            match result {
+                Ok(value) => {
+                    self.circuit_on_success(&policy.retry.circuit_breaker, context)
+                        .await;
+                    return Ok(value);
                 }
                 Err(status) => {
-                    handle_failure(context, &status).await;
-                    return Err(status);
+                    self.circuit_on_failure(&policy.retry.circuit_breaker, context)
+                        .await;
+                    if !should_retry(&status, attempt, &policy.retry) {
+                        return Err(status);
+                    }
+                    let delay = retry_delay(attempt, &policy.retry.backoff);
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
+    }
 
-        let Some(final_response) = final_response else {
-            let status = Status::data_loss("invoke tool stream ended without final response");
-            handle_failure(context, &status).await;
-            return Err(status);
-        };
-
-        handle_success(context, &final_response).await;
-        Ok(final_response)
+    async fn invoke_tool_stream_with_retry(
+        &mut self,
+        request: InvokeToolRequest,
+        context: &InvocationContext<'_>,
+    ) -> Result<InvokeToolResponse, Status> {
+        let policy = context.worker_policy.as_ref().cloned().unwrap_or_default();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let decision = self
+                .circuit_allow(&policy.retry.circuit_breaker, context)
+                .await;
+            if let CircuitDecision::FailFast(status) = decision {
+                return Err(status);
+            }
+            let request = build_request(request.clone(), context);
+            let result = match self.client.invoke_tool_stream(request).await {
+                Ok(response) => {
+                    let mut stream = response.into_inner();
+                    let mut final_response = None;
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(chunk) => {
+                                if let Some(action) = handle_chunk(context, &chunk).await {
+                                    final_response = Some(action);
+                                }
+                            }
+                            Err(status) => return Err(status),
+                        }
+                    }
+                    let Some(final_response) = final_response else {
+                        return Err(Status::data_loss(
+                            "invoke tool stream ended without final response",
+                        ));
+                    };
+                    Ok(final_response)
+                }
+                Err(status) => Err(status),
+            };
+            match result {
+                Ok(value) => {
+                    self.circuit_on_success(&policy.retry.circuit_breaker, context)
+                        .await;
+                    return Ok(value);
+                }
+                Err(status) => {
+                    self.circuit_on_failure(&policy.retry.circuit_breaker, context)
+                        .await;
+                    if !should_retry(&status, attempt, &policy.retry) {
+                        return Err(status);
+                    }
+                    let delay = retry_delay(attempt, &policy.retry.backoff);
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 }
 
@@ -142,7 +244,7 @@ fn build_request(
         request.deadline = Some(system_time_to_timestamp(deadline));
     }
     let mut request = Request::new(request);
-    if let Some(timeout) = timeout_from_budget(SystemTime::now(), &context.budget) {
+    if let Some(timeout) = effective_timeout(SystemTime::now(), &context.budget, context) {
         request.set_timeout(timeout);
     }
     request
@@ -304,6 +406,30 @@ fn timeout_from_budget(now: SystemTime, budget: &InvocationBudget) -> Option<Dur
     )
 }
 
+fn effective_timeout(
+    now: SystemTime,
+    budget: &InvocationBudget,
+    context: &InvocationContext<'_>,
+) -> Option<Duration> {
+    let budget_timeout = timeout_from_budget(now, budget);
+    let policy_timeout = context
+        .worker_policy
+        .as_ref()
+        .and_then(|policy| policy.timeout_ms)
+        .or_else(|| WorkerPolicy::default().timeout_ms)
+        .map(Duration::from_millis);
+    merge_timeout(budget_timeout, policy_timeout)
+}
+
+fn merge_timeout(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
 fn now_timestamp() -> Timestamp {
     system_time_to_timestamp(SystemTime::now())
 }
@@ -330,6 +456,195 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{:02x}", byte));
     }
     out
+}
+
+fn should_retry(status: &Status, attempt: u32, policy: &WorkerRetryPolicy) -> bool {
+    if policy.max_attempts == 0 {
+        return false;
+    }
+    if attempt >= policy.max_attempts {
+        return false;
+    }
+    is_retryable(status, policy)
+}
+
+fn is_retryable(status: &Status, policy: &WorkerRetryPolicy) -> bool {
+    policy
+        .retry_on
+        .iter()
+        .any(|condition| status_matches_condition(status, condition))
+}
+
+fn status_matches_condition(status: &Status, condition: &WorkerRetryCondition) -> bool {
+    match condition {
+        WorkerRetryCondition::Timeout => status.code() == tonic::Code::DeadlineExceeded,
+        WorkerRetryCondition::TransientNetwork => {
+            matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::Unknown
+            )
+        }
+        WorkerRetryCondition::GrpcUnavailable => status.code() == tonic::Code::Unavailable,
+        WorkerRetryCondition::GrpcDeadlineExceeded => {
+            status.code() == tonic::Code::DeadlineExceeded
+        }
+        WorkerRetryCondition::GrpcResourceExhausted => {
+            status.code() == tonic::Code::ResourceExhausted
+        }
+        WorkerRetryCondition::GrpcAborted => status.code() == tonic::Code::Aborted,
+        WorkerRetryCondition::GrpcCancelled => status.code() == tonic::Code::Cancelled,
+        WorkerRetryCondition::GrpcUnknown => status.code() == tonic::Code::Unknown,
+        WorkerRetryCondition::GrpcInternal => status.code() == tonic::Code::Internal,
+    }
+}
+
+fn retry_delay(attempt: u32, backoff: &RetryBackoff) -> Duration {
+    let attempt = attempt.max(1);
+    let base = backoff.base_delay_ms;
+    let raw_delay = match backoff.policy {
+        RetryBackoffPolicy::Exponential => {
+            let shift = attempt.saturating_sub(1);
+            let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+            base.saturating_mul(multiplier)
+        }
+        RetryBackoffPolicy::Linear => base.saturating_mul(attempt as u64),
+        RetryBackoffPolicy::Constant => base,
+    };
+    let capped = raw_delay.min(backoff.max_delay_ms);
+    let jittered = apply_jitter(capped, backoff.jitter.clone());
+    Duration::from_millis(jittered)
+}
+
+fn apply_jitter(delay_ms: u64, jitter: RetryJitter) -> u64 {
+    if delay_ms == 0 {
+        return 0;
+    }
+    match jitter {
+        RetryJitter::None => delay_ms,
+        RetryJitter::Full => random_bounded(delay_ms),
+        RetryJitter::Equal => {
+            let half = delay_ms / 2;
+            half + random_bounded(delay_ms - half)
+        }
+    }
+}
+
+fn random_bounded(max_exclusive: u64) -> u64 {
+    if max_exclusive <= 1 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .subsec_nanos() as u64;
+    nanos % max_exclusive
+}
+
+impl WorkerClient {
+    async fn circuit_allow(
+        &mut self,
+        policy: &CircuitBreakerPolicy,
+        context: &InvocationContext<'_>,
+    ) -> CircuitDecision {
+        if !policy.enabled {
+            return CircuitDecision::Allow;
+        }
+        let now = SystemTime::now();
+        match self.circuit_breaker.clone() {
+            CircuitBreakerState::Open { open_until } if now < open_until => {
+                return CircuitDecision::FailFast(Status::unavailable(
+                    "worker circuit breaker open",
+                ));
+            }
+            CircuitBreakerState::Open { .. } => {
+                self.circuit_breaker = CircuitBreakerState::HalfOpen;
+                emit_circuit_event(context, "worker_circuit_half_open", policy, None).await;
+            }
+            _ => {}
+        }
+        CircuitDecision::Allow
+    }
+
+    async fn circuit_on_failure(
+        &mut self,
+        policy: &CircuitBreakerPolicy,
+        context: &InvocationContext<'_>,
+    ) {
+        if !policy.enabled {
+            return;
+        }
+        let now = SystemTime::now();
+        match &mut self.circuit_breaker {
+            CircuitBreakerState::Closed { failures } => {
+                *failures = failures.saturating_add(1);
+                let failure_count = *failures;
+                if failure_count >= policy.open_after_failures {
+                    let open_until = now
+                        .checked_add(Duration::from_millis(policy.half_open_after_ms))
+                        .unwrap_or(now);
+                    self.circuit_breaker = CircuitBreakerState::Open { open_until };
+                    emit_circuit_event(context, "worker_circuit_open", policy, Some(failure_count))
+                        .await;
+                }
+            }
+            CircuitBreakerState::HalfOpen => {
+                let open_until = now
+                    .checked_add(Duration::from_millis(policy.half_open_after_ms))
+                    .unwrap_or(now);
+                self.circuit_breaker = CircuitBreakerState::Open { open_until };
+                emit_circuit_event(context, "worker_circuit_open", policy, Some(1)).await;
+            }
+            CircuitBreakerState::Open { .. } => {}
+        }
+    }
+
+    async fn circuit_on_success(
+        &mut self,
+        policy: &CircuitBreakerPolicy,
+        context: &InvocationContext<'_>,
+    ) {
+        if !policy.enabled {
+            return;
+        }
+        match self.circuit_breaker {
+            CircuitBreakerState::Closed { ref mut failures } => {
+                *failures = 0;
+            }
+            _ => {
+                self.circuit_breaker = CircuitBreakerState::Closed { failures: 0 };
+                emit_circuit_event(context, "worker_circuit_closed", policy, Some(0)).await;
+            }
+        }
+    }
+}
+
+async fn emit_circuit_event(
+    context: &InvocationContext<'_>,
+    kind: &str,
+    policy: &CircuitBreakerPolicy,
+    failures: Option<u32>,
+) {
+    let mut attrs = std::collections::HashMap::new();
+    attrs.insert(
+        "open_after_failures".to_string(),
+        policy.open_after_failures.to_string(),
+    );
+    attrs.insert(
+        "half_open_after_ms".to_string(),
+        policy.half_open_after_ms.to_string(),
+    );
+    if let Some(failures) = failures {
+        attrs.insert("failures".to_string(), failures.to_string());
+    }
+    let event = RunEvent {
+        event_seq: 0,
+        ts: Some(now_timestamp()),
+        event: Some(run_event::Event::Policy(PolicyEvent {
+            kind: kind.to_string(),
+            attrs,
+        })),
+    };
+    context.event_log.append(event).await;
 }
 
 #[cfg(test)]
@@ -503,6 +818,7 @@ mod tests {
             state_store: &state_store,
             budget: InvocationBudget::default(),
             trace_context: None,
+            worker_policy: None,
         };
 
         let request = InvokeToolRequest {
@@ -550,6 +866,7 @@ mod tests {
             state_store: &state_store,
             budget: InvocationBudget::default(),
             trace_context: None,
+            worker_policy: None,
         };
 
         let request = InvokeToolRequest {

@@ -25,6 +25,7 @@ Before applying JCS, sort arrays that are semantically sets:
 - rate_limit.providers: sort by provider_id asc
 - guardrails.pre_call/during_call/post_call: sort by name asc
 - retry.retry_on: sort asc
+- worker.retry.retry_on: sort asc
 - cache.rules: sort by priority asc, then name asc
 - resource_pools: sort by resource_id asc
 

@@ -637,6 +637,7 @@ impl CorkCore for CorkCoreService {
                 hash_bundle: Some(hash_bundle.clone()),
                 stage_auto_commit: Some(validated_policy.stage_auto_commit),
                 watchdog_policy: validated_policy.watchdog,
+                worker_policy: Some(validated_policy.worker),
                 next_patch_seq: Some(0),
                 active_stage_id: Some(active_stage_id.to_string()),
                 active_stage_expansion_policy: Some(expansion_policy),

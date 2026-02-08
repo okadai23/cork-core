@@ -38,6 +38,7 @@ pub struct RunMetadata {
     pub variant_id: Option<String>,
     pub stage_auto_commit: Option<StageAutoCommitPolicy>,
     pub watchdog_policy: Option<WatchdogPolicy>,
+    pub worker_policy: Option<WorkerPolicy>,
     pub next_patch_seq: u64,
     pub active_stage_id: Option<String>,
     pub active_stage_expansion_policy: Option<ExpansionPolicy>,
@@ -62,6 +63,98 @@ pub struct WatchdogPolicy {
     pub idle_ttl_ms: Option<u64>,
     pub max_total_patch_count: Option<u64>,
     pub max_patch_count_per_stage: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerPolicy {
+    pub timeout_ms: Option<u64>,
+    pub retry: WorkerRetryPolicy,
+}
+
+impl Default for WorkerPolicy {
+    fn default() -> Self {
+        Self {
+            timeout_ms: Some(30_000),
+            retry: WorkerRetryPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRetryPolicy {
+    pub max_attempts: u32,
+    pub backoff: RetryBackoff,
+    pub retry_on: Vec<WorkerRetryCondition>,
+    pub circuit_breaker: CircuitBreakerPolicy,
+}
+
+impl Default for WorkerRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            backoff: RetryBackoff {
+                policy: RetryBackoffPolicy::Exponential,
+                base_delay_ms: 200,
+                max_delay_ms: 2_000,
+                jitter: RetryJitter::Full,
+            },
+            retry_on: vec![
+                WorkerRetryCondition::Timeout,
+                WorkerRetryCondition::TransientNetwork,
+                WorkerRetryCondition::GrpcUnavailable,
+                WorkerRetryCondition::GrpcDeadlineExceeded,
+                WorkerRetryCondition::GrpcResourceExhausted,
+                WorkerRetryCondition::GrpcAborted,
+            ],
+            circuit_breaker: CircuitBreakerPolicy {
+                enabled: true,
+                open_after_failures: 5,
+                half_open_after_ms: 5_000,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryBackoff {
+    pub policy: RetryBackoffPolicy,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub jitter: RetryJitter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryBackoffPolicy {
+    Exponential,
+    Linear,
+    Constant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryJitter {
+    None,
+    Full,
+    Equal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerRetryCondition {
+    Timeout,
+    TransientNetwork,
+    GrpcUnavailable,
+    GrpcDeadlineExceeded,
+    GrpcResourceExhausted,
+    GrpcAborted,
+    GrpcCancelled,
+    GrpcUnknown,
+    GrpcInternal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitBreakerPolicy {
+    pub enabled: bool,
+    pub open_after_failures: u32,
+    pub half_open_after_ms: u64,
 }
 
 #[derive(Debug)]
@@ -92,6 +185,10 @@ impl RunCtx {
 
     pub async fn watchdog_policy(&self) -> Option<WatchdogPolicy> {
         self.metadata.read().await.watchdog_policy.clone()
+    }
+
+    pub async fn worker_policy(&self) -> Option<WorkerPolicy> {
+        self.metadata.read().await.worker_policy.clone()
     }
 
     pub async fn next_patch_seq(&self) -> u64 {
@@ -259,6 +356,7 @@ pub struct CreateRunInput {
     pub hash_bundle: Option<HashBundle>,
     pub stage_auto_commit: Option<StageAutoCommitPolicy>,
     pub watchdog_policy: Option<WatchdogPolicy>,
+    pub worker_policy: Option<WorkerPolicy>,
     pub next_patch_seq: Option<u64>,
     pub active_stage_id: Option<String>,
     pub active_stage_expansion_policy: Option<ExpansionPolicy>,
@@ -813,6 +911,7 @@ impl RunRegistry for InMemoryRunRegistry {
             variant_id: input.variant_id,
             stage_auto_commit: input.stage_auto_commit,
             watchdog_policy: input.watchdog_policy,
+            worker_policy: input.worker_policy,
             next_patch_seq: input.next_patch_seq.unwrap_or(0),
             active_stage_id: input.active_stage_id,
             active_stage_expansion_policy: input.active_stage_expansion_policy,
