@@ -511,7 +511,7 @@ mod tests {
             .expect("output");
         assert_eq!(output.payload.data, b"ok");
 
-        let events = event_log.subscribe(0).await.backlog;
+        let events = event_log.subscribe(0).await.expect("subscribe").backlog;
         assert!(events.iter().any(|event| matches!(
             event.event.as_ref(),
             Some(run_event::Event::NodeState(NodeStateChanged { new_status, .. }))
@@ -555,7 +555,7 @@ mod tests {
             .expect("invoke stream");
         assert!(response.output.is_some());
 
-        let events = event_log.subscribe(0).await.backlog;
+        let events = event_log.subscribe(0).await.expect("subscribe").backlog;
         assert!(events.iter().any(|event| matches!(
             event.event.as_ref(),
             Some(run_event::Event::Log(LogRecord { message, .. }))

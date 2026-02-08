@@ -323,7 +323,7 @@ mod tests {
             stage_states.get("stage-b").expect("stage-b state").status,
             StageRuntimeStatus::Active
         );
-        let events = event_log.subscribe(0).await.backlog;
+        let events = event_log.subscribe(0).await.expect("subscribe").backlog;
         assert_eq!(events.len(), 1);
         match events[0].event.as_ref().expect("event") {
             run_event::Event::Stage(stage_event) => {
@@ -450,6 +450,13 @@ mod tests {
             stage_states.get("stage-a").expect("stage-a state").status,
             StageRuntimeStatus::Active
         );
-        assert!(event_log.subscribe(0).await.backlog.is_empty());
+        assert!(
+            event_log
+                .subscribe(0)
+                .await
+                .expect("subscribe")
+                .backlog
+                .is_empty()
+        );
     }
 }

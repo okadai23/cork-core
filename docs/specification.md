@@ -363,6 +363,17 @@ cork/
 
 ---
 
+### 15.4 EventLog / LogStore の retention & backpressure
+
+- EventLog / LogStore は **保持上限を超えたデータを自動で削除** し、メモリが無制限に増えないようにする。
+  - EventLog: `max_events`, `max_bytes`, `max_age`, `broadcast_capacity`
+  - LogStore: `max_records`, `max_bytes`, `max_age`
+  - 設定は in-memory 実装の `*Config` で指定し、`CorkCoreServiceConfig` 経由でサービスに適用できる。
+- StreamRunEvents は bounded な broadcast を利用し、購読者が遅延して **読み取りに追いつけない場合は UNAVAILABLE で切断** する（disconnect 方針）。
+- `since_event_seq` が retention で保持されている最古 seq よりも古い場合は **OUT_OF_RANGE** を返す。
+  - クライアントは再接続時に最新 or 最古 seq からのリプレイに切り替える。
+- GetLogs は retention 範囲内のログのみ返却し、保持外の古いログは取得できない。
+
 ## 16. 採用ライブラリ（Rust MVP）
 
 | 用途 | ライブラリ | 備考 |

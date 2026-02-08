@@ -6,15 +6,17 @@
 //!
 //! Run registry is implemented for CORE-010. Additional stores are TODO.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use cork_proto::cork::v1::{CanonicalJsonDocument, HashBundle, LogRecord, RunEvent, RunStatus};
 use dashmap::DashMap;
+use prost::Message;
+use prost_types::Timestamp;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
@@ -822,38 +824,128 @@ fn decode_page_token(token: Option<&str>) -> Option<usize> {
     offset.parse::<usize>().ok()
 }
 
+fn timestamp_to_system_time(timestamp: &Timestamp) -> Option<SystemTime> {
+    let seconds = u64::try_from(timestamp.seconds).ok()?;
+    let nanos = u32::try_from(timestamp.nanos).ok()?;
+    Some(UNIX_EPOCH + Duration::new(seconds, nanos))
+}
+
+#[derive(Debug)]
 pub struct EventSubscription {
     pub backlog: Vec<RunEvent>,
     pub receiver: broadcast::Receiver<RunEvent>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EventLogConfig {
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub max_age: Option<Duration>,
+    pub broadcast_capacity: usize,
+}
+
+impl Default for EventLogConfig {
+    fn default() -> Self {
+        Self {
+            max_events: 10_000,
+            max_bytes: 16 * 1024 * 1024,
+            max_age: None,
+            broadcast_capacity: 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventLogError {
+    OutOfRange { oldest_seq: u64, requested_seq: u64 },
+}
+
 #[async_trait]
 pub trait EventLog: Send + Sync {
     async fn append(&self, event: RunEvent) -> RunEvent;
-    async fn subscribe(&self, since_seq: u64) -> EventSubscription;
+    async fn subscribe(&self, since_seq: u64) -> Result<EventSubscription, EventLogError>;
 }
 
 #[derive(Debug)]
 pub struct InMemoryEventLog {
     state: RwLock<EventLogState>,
     sender: broadcast::Sender<RunEvent>,
+    config: EventLogConfig,
 }
 
 #[derive(Debug)]
 struct EventLogState {
     next_seq: u64,
-    events: Vec<RunEvent>,
+    base_seq: u64,
+    events: VecDeque<StoredEvent>,
+    total_bytes: usize,
+}
+
+#[derive(Debug)]
+struct StoredEvent {
+    event: RunEvent,
+    bytes: usize,
+    ts: Option<SystemTime>,
 }
 
 impl InMemoryEventLog {
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(1024);
+        Self::new_with_config(EventLogConfig::default())
+    }
+
+    pub fn new_with_config(config: EventLogConfig) -> Self {
+        let (sender, _) = broadcast::channel(config.broadcast_capacity);
         Self {
             state: RwLock::new(EventLogState {
                 next_seq: 0,
-                events: Vec::new(),
+                base_seq: 0,
+                events: VecDeque::new(),
+                total_bytes: 0,
             }),
             sender,
+            config,
+        }
+    }
+
+    fn prune_state(&self, state: &mut EventLogState, now: SystemTime) {
+        if let Some(max_age) = self.config.max_age {
+            let cutoff = now.checked_sub(max_age);
+            while let Some(front) = state.events.front() {
+                let Some(cutoff) = cutoff else {
+                    break;
+                };
+                let Some(ts) = front.ts else {
+                    break;
+                };
+                if ts >= cutoff {
+                    break;
+                }
+                let removed = state.events.pop_front().expect("front exists");
+                state.total_bytes = state.total_bytes.saturating_sub(removed.bytes);
+                state.base_seq = state.base_seq.saturating_add(1);
+            }
+        }
+
+        while state.events.len() > self.config.max_events {
+            if let Some(removed) = state.events.pop_front() {
+                state.total_bytes = state.total_bytes.saturating_sub(removed.bytes);
+                state.base_seq = state.base_seq.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+
+        while state.total_bytes > self.config.max_bytes {
+            if let Some(removed) = state.events.pop_front() {
+                state.total_bytes = state.total_bytes.saturating_sub(removed.bytes);
+                state.base_seq = state.base_seq.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+
+        if state.events.is_empty() {
+            state.base_seq = state.next_seq;
         }
     }
 }
@@ -871,24 +963,43 @@ impl EventLog for InMemoryEventLog {
         let seq = state.next_seq;
         state.next_seq = state.next_seq.saturating_add(1);
         event.event_seq = seq as i64;
-        state.events.push(event.clone());
+        let bytes = event.encoded_len();
+        let ts = event.ts.as_ref().and_then(timestamp_to_system_time);
+        state.events.push_back(StoredEvent {
+            event: event.clone(),
+            bytes,
+            ts,
+        });
+        state.total_bytes = state.total_bytes.saturating_add(bytes);
+        self.prune_state(&mut state, SystemTime::now());
         drop(state);
         let _ = self.sender.send(event.clone());
         event
     }
 
-    async fn subscribe(&self, since_seq: u64) -> EventSubscription {
+    async fn subscribe(&self, since_seq: u64) -> Result<EventSubscription, EventLogError> {
         let receiver = self.sender.subscribe();
         let backlog = {
             let state = self.state.read().await;
-            let start = usize::try_from(since_seq).unwrap_or(state.events.len());
+            if since_seq < state.base_seq {
+                return Err(EventLogError::OutOfRange {
+                    oldest_seq: state.base_seq,
+                    requested_seq: since_seq,
+                });
+            }
+            let start = usize::try_from(since_seq - state.base_seq).unwrap_or(state.events.len());
             if start >= state.events.len() {
                 Vec::new()
             } else {
-                state.events[start..].to_vec()
+                state
+                    .events
+                    .iter()
+                    .skip(start)
+                    .map(|stored| stored.event.clone())
+                    .collect()
             }
         };
-        EventSubscription { backlog, receiver }
+        Ok(EventSubscription { backlog, receiver })
     }
 }
 
@@ -906,6 +1017,23 @@ pub struct LogPage {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LogStoreConfig {
+    pub max_records: usize,
+    pub max_bytes: usize,
+    pub max_age: Option<Duration>,
+}
+
+impl Default for LogStoreConfig {
+    fn default() -> Self {
+        Self {
+            max_records: 10_000,
+            max_bytes: 16 * 1024 * 1024,
+            max_age: None,
+        }
+    }
+}
+
 pub trait LogStore: Send + Sync {
     fn append_log(&self, run_id: &str, stage_id: &str, node_id: &str, log: LogRecord) -> LogRecord;
     fn list_logs(
@@ -920,18 +1048,67 @@ pub trait LogStore: Send + Sync {
 #[derive(Debug)]
 pub struct InMemoryLogStore {
     runs: DashMap<String, RunLogState>,
+    config: LogStoreConfig,
 }
 
 #[derive(Debug)]
 struct RunLogState {
-    logs: Vec<LogRecord>,
+    logs: VecDeque<StoredLog>,
+    total_bytes: usize,
     next_scope_seq: HashMap<String, u64>,
+}
+
+#[derive(Debug)]
+struct StoredLog {
+    log: LogRecord,
+    bytes: usize,
+    ts: Option<SystemTime>,
 }
 
 impl InMemoryLogStore {
     pub fn new() -> Self {
+        Self::new_with_config(LogStoreConfig::default())
+    }
+
+    pub fn new_with_config(config: LogStoreConfig) -> Self {
         Self {
             runs: DashMap::new(),
+            config,
+        }
+    }
+
+    fn prune_state(&self, state: &mut RunLogState, now: SystemTime) {
+        if let Some(max_age) = self.config.max_age {
+            let cutoff = now.checked_sub(max_age);
+            while let Some(front) = state.logs.front() {
+                let Some(cutoff) = cutoff else {
+                    break;
+                };
+                let Some(ts) = front.ts else {
+                    break;
+                };
+                if ts >= cutoff {
+                    break;
+                }
+                let removed = state.logs.pop_front().expect("front exists");
+                state.total_bytes = state.total_bytes.saturating_sub(removed.bytes);
+            }
+        }
+
+        while state.logs.len() > self.config.max_records {
+            if let Some(removed) = state.logs.pop_front() {
+                state.total_bytes = state.total_bytes.saturating_sub(removed.bytes);
+            } else {
+                break;
+            }
+        }
+
+        while state.total_bytes > self.config.max_bytes {
+            if let Some(removed) = state.logs.pop_front() {
+                state.total_bytes = state.total_bytes.saturating_sub(removed.bytes);
+            } else {
+                break;
+            }
         }
     }
 
@@ -977,7 +1154,8 @@ impl LogStore for InMemoryLogStore {
             .runs
             .entry(run_id.to_string())
             .or_insert_with(|| RunLogState {
-                logs: Vec::new(),
+                logs: VecDeque::new(),
+                total_bytes: 0,
                 next_scope_seq: HashMap::new(),
             });
 
@@ -987,7 +1165,15 @@ impl LogStore for InMemoryLogStore {
         log.scope_seq = *seq as i64;
         *seq = seq.saturating_add(1);
         Self::ensure_attrs(&mut log.attrs, stage_id, node_id);
-        state.logs.push(log.clone());
+        let bytes = log.encoded_len();
+        let ts = log.ts.as_ref().and_then(timestamp_to_system_time);
+        state.logs.push_back(StoredLog {
+            log: log.clone(),
+            bytes,
+            ts,
+        });
+        state.total_bytes = state.total_bytes.saturating_add(bytes);
+        self.prune_state(&mut state, SystemTime::now());
         log
     }
 
@@ -1009,7 +1195,8 @@ impl LogStore for InMemoryLogStore {
         };
 
         let mut filtered = Vec::new();
-        for log in &state.logs {
+        for stored in &state.logs {
+            let log = &stored.log;
             if let Some(ref scope_id) = filters.scope_id
                 && &log.scope_id != scope_id
             {
@@ -1312,7 +1499,7 @@ mod tests {
         let log = InMemoryEventLog::new();
         log.append(RunEvent::default()).await;
 
-        let mut subscription = log.subscribe(0).await;
+        let mut subscription = log.subscribe(0).await.expect("subscribe");
         assert_eq!(subscription.backlog.len(), 1);
         assert_eq!(subscription.backlog[0].event_seq, 0);
 
@@ -1323,8 +1510,92 @@ mod tests {
             .expect("recv failed");
         assert_eq!(received.event_seq, 1);
 
-        let empty = log.subscribe(2).await;
+        let empty = log.subscribe(2).await.expect("subscribe");
         assert!(empty.backlog.is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_log_retention_bounds_backlog() {
+        let log = InMemoryEventLog::new_with_config(EventLogConfig {
+            max_events: 2,
+            max_bytes: 1024,
+            max_age: None,
+            broadcast_capacity: 8,
+        });
+        log.append(RunEvent::default()).await;
+        log.append(RunEvent::default()).await;
+        log.append(RunEvent::default()).await;
+
+        let err = log.subscribe(0).await.expect_err("out of range");
+        assert_eq!(
+            err,
+            EventLogError::OutOfRange {
+                oldest_seq: 1,
+                requested_seq: 0
+            }
+        );
+
+        let subscription = log.subscribe(1).await.expect("subscribe");
+        let seq_values: Vec<i64> = subscription
+            .backlog
+            .iter()
+            .map(|event| event.event_seq)
+            .collect();
+        assert_eq!(seq_values, vec![1, 2]);
+    }
+
+    #[test]
+    fn log_store_retention_bounds_records() {
+        let sample_log = LogRecord {
+            level: "INFO".to_string(),
+            message: "payload".to_string(),
+            trace_id_hex: "".to_string(),
+            span_id_hex: "".to_string(),
+            scope_id: "".to_string(),
+            scope_seq: 0,
+            attrs: Default::default(),
+            ts: None,
+        };
+        let store = InMemoryLogStore::new_with_config(LogStoreConfig {
+            max_records: 2,
+            max_bytes: usize::MAX,
+            max_age: None,
+        });
+        let run_id = "run-retention";
+        for idx in 0..3 {
+            let log = LogRecord {
+                message: format!("log-{idx}"),
+                ..sample_log.clone()
+            };
+            store.append_log(run_id, "stage", "node", log);
+        }
+
+        let page = store.list_logs(run_id, None, LogFilters::default(), 10);
+        let messages: Vec<String> = page.logs.iter().map(|log| log.message.clone()).collect();
+        assert_eq!(messages, vec!["log-1".to_string(), "log-2".to_string()]);
+    }
+
+    #[test]
+    fn log_store_retention_bounds_bytes() {
+        let store = InMemoryLogStore::new_with_config(LogStoreConfig {
+            max_records: 10,
+            max_bytes: 1,
+            max_age: None,
+        });
+        let run_id = "run-bytes";
+        let log = LogRecord {
+            level: "INFO".to_string(),
+            message: "payload".to_string(),
+            trace_id_hex: "".to_string(),
+            span_id_hex: "".to_string(),
+            scope_id: "".to_string(),
+            scope_seq: 0,
+            attrs: Default::default(),
+            ts: None,
+        };
+        store.append_log(run_id, "stage", "node", log);
+        let page = store.list_logs(run_id, None, LogFilters::default(), 10);
+        assert!(page.logs.is_empty());
     }
 
     #[test]

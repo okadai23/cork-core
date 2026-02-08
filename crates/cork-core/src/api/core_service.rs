@@ -20,9 +20,9 @@ use cork_proto::cork::v1::{
     SubmitRunResponse, cork_core_server::CorkCore,
 };
 use cork_store::{
-    CreateRunInput, EventLog, InMemoryEventLog, InMemoryGraphStore, InMemoryLogStore,
-    InMemoryPatchStore, InMemoryRunRegistry, InMemoryStateStore, LogFilters, LogStore, PatchStore,
-    RunCtx, RunRegistry,
+    CreateRunInput, EventLog, EventLogConfig, EventLogError, InMemoryEventLog, InMemoryGraphStore,
+    InMemoryLogStore, InMemoryPatchStore, InMemoryRunRegistry, InMemoryStateStore, LogFilters,
+    LogStore, LogStoreConfig, PatchStore, RunCtx, RunRegistry,
 };
 use dashmap::DashMap;
 use prost_types::Timestamp;
@@ -36,11 +36,18 @@ use tonic::{Request, Response, Status};
 /// The CorkCore service implementation.
 pub struct CorkCoreService {
     event_logs: DashMap<String, Arc<InMemoryEventLog>>,
+    event_log_config: EventLogConfig,
     graph_store: Arc<InMemoryGraphStore>,
     log_store: Arc<InMemoryLogStore>,
     patch_store: Arc<InMemoryPatchStore>,
     run_registry: Arc<dyn RunRegistry>,
     state_store: Arc<InMemoryStateStore>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CorkCoreServiceConfig {
+    pub event_log: EventLogConfig,
+    pub log_store: LogStoreConfig,
 }
 
 impl CorkCoreService {
@@ -49,9 +56,22 @@ impl CorkCoreService {
         Self::default()
     }
 
+    pub fn with_config(config: CorkCoreServiceConfig) -> Self {
+        Self {
+            event_logs: DashMap::new(),
+            event_log_config: config.event_log,
+            graph_store: Arc::new(InMemoryGraphStore::new()),
+            log_store: Arc::new(InMemoryLogStore::new_with_config(config.log_store)),
+            patch_store: Arc::new(InMemoryPatchStore::new()),
+            run_registry: Arc::new(InMemoryRunRegistry::new()),
+            state_store: Arc::new(InMemoryStateStore::new()),
+        }
+    }
+
     pub fn with_run_registry(run_registry: Arc<dyn RunRegistry>) -> Self {
         Self {
             event_logs: DashMap::new(),
+            event_log_config: EventLogConfig::default(),
             graph_store: Arc::new(InMemoryGraphStore::new()),
             log_store: Arc::new(InMemoryLogStore::new()),
             patch_store: Arc::new(InMemoryPatchStore::new()),
@@ -68,7 +88,11 @@ impl CorkCoreService {
         let entry = self
             .event_logs
             .entry(run_id.to_string())
-            .or_insert_with(|| Arc::new(InMemoryEventLog::new()));
+            .or_insert_with(|| {
+                Arc::new(InMemoryEventLog::new_with_config(
+                    self.event_log_config.clone(),
+                ))
+            });
         Arc::clone(&*entry)
     }
 
@@ -87,14 +111,7 @@ impl CorkCoreService {
 
 impl Default for CorkCoreService {
     fn default() -> Self {
-        Self {
-            event_logs: DashMap::new(),
-            graph_store: Arc::new(InMemoryGraphStore::new()),
-            log_store: Arc::new(InMemoryLogStore::new()),
-            patch_store: Arc::new(InMemoryPatchStore::new()),
-            run_registry: Arc::new(InMemoryRunRegistry::new()),
-            state_store: Arc::new(InMemoryStateStore::new()),
-        }
+        Self::with_config(CorkCoreServiceConfig::default())
     }
 }
 
@@ -588,7 +605,17 @@ impl CorkCore for CorkCoreService {
         }
         let since_seq = request.since_event_seq as u64;
         let log = self.event_log_for_run(&handle.run_id);
-        let subscription = log.subscribe(since_seq).await;
+        let subscription = match log.subscribe(since_seq).await {
+            Ok(subscription) => subscription,
+            Err(EventLogError::OutOfRange {
+                oldest_seq,
+                requested_seq,
+            }) => {
+                return Err(Status::out_of_range(format!(
+                    "since_event_seq {requested_seq} is older than retention (oldest {oldest_seq})"
+                )));
+            }
+        };
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
@@ -842,8 +869,8 @@ mod tests {
         LogRecord, RunHandle, Sha256, StreamRunEventsRequest,
     };
     use cork_store::{
-        CreateRunInput, ExpansionPolicy, GraphStore, InMemoryRunRegistry, LogStore, PatchStore,
-        RunRegistry, StateStore,
+        CreateRunInput, EventLogConfig, ExpansionPolicy, GraphStore, InMemoryRunRegistry, LogStore,
+        LogStoreConfig, PatchStore, RunRegistry, StateStore,
     };
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -1120,6 +1147,36 @@ mod tests {
             .expect("stream item")
             .expect("stream event");
         assert_eq!(second.event_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_run_events_rejects_out_of_range_since_seq() {
+        let service = CorkCoreService::with_config(CorkCoreServiceConfig {
+            event_log: EventLogConfig {
+                max_events: 1,
+                max_bytes: 1024,
+                max_age: None,
+                broadcast_capacity: 8,
+            },
+            log_store: LogStoreConfig::default(),
+        });
+        let run_id = "run-out-of-range";
+        let log = service.event_log_for_run(run_id);
+        log.append(RunEvent::default()).await;
+        log.append(RunEvent::default()).await;
+
+        let request = StreamRunEventsRequest {
+            handle: Some(RunHandle {
+                run_id: run_id.to_string(),
+            }),
+            since_event_seq: 0,
+        };
+
+        let err = service
+            .stream_run_events(Request::new(request))
+            .await
+            .expect_err("out of range");
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
     }
 
     #[tokio::test]
@@ -1560,7 +1617,7 @@ mod tests {
         assert_eq!(run_state.pointer("/state/value/ok"), Some(&json!(true)));
 
         let log = service.event_log_for_run(&handle.run_id);
-        let subscription = log.subscribe(0).await;
+        let subscription = log.subscribe(0).await.expect("subscribe");
         assert_eq!(subscription.backlog.len(), 1);
         let event = &subscription.backlog[0];
         match event.event.as_ref() {

@@ -1634,7 +1634,7 @@ mod tests {
             NodeRuntimeStatus::Succeeded
         );
 
-        let events = event_log.subscribe(0).await.backlog;
+        let events = event_log.subscribe(0).await.expect("subscribe").backlog;
         let node_events: Vec<NodeStateChanged> = events
             .into_iter()
             .filter_map(|event| match event.event {

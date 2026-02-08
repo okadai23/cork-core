@@ -11,3 +11,5 @@ cork-proto = { workspace = true }
 tokio = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
