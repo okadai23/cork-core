@@ -37,11 +37,15 @@ pub struct RunMetadata {
     pub experiment_id: Option<String>,
     pub variant_id: Option<String>,
     pub stage_auto_commit: Option<StageAutoCommitPolicy>,
+    pub watchdog_policy: Option<WatchdogPolicy>,
     pub next_patch_seq: u64,
     pub active_stage_id: Option<String>,
     pub active_stage_expansion_policy: Option<ExpansionPolicy>,
     pub stage_started_at: Option<SystemTime>,
     pub last_patch_at: Option<SystemTime>,
+    pub last_progress_at: Option<SystemTime>,
+    pub total_patch_count: u64,
+    pub stage_patch_counts: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +54,14 @@ pub struct StageAutoCommitPolicy {
     pub quiescence_ms: u64,
     pub max_open_ms: u64,
     pub exclude_when_waiting: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchdogPolicy {
+    pub run_ttl_ms: Option<u64>,
+    pub idle_ttl_ms: Option<u64>,
+    pub max_total_patch_count: Option<u64>,
+    pub max_patch_count_per_stage: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -76,6 +88,10 @@ impl RunCtx {
 
     pub async fn stage_auto_commit(&self) -> Option<StageAutoCommitPolicy> {
         self.metadata.read().await.stage_auto_commit.clone()
+    }
+
+    pub async fn watchdog_policy(&self) -> Option<WatchdogPolicy> {
+        self.metadata.read().await.watchdog_policy.clone()
     }
 
     pub async fn next_patch_seq(&self) -> u64 {
@@ -133,9 +149,16 @@ impl RunCtx {
         self.metadata.read().await.last_patch_at
     }
 
+    pub async fn last_progress_at(&self) -> Option<SystemTime> {
+        self.metadata.read().await.last_progress_at
+    }
+
     pub async fn set_stage_started_at(&self, stage_started_at: Option<SystemTime>) {
         let mut metadata = self.metadata.write().await;
         metadata.stage_started_at = stage_started_at;
+        if stage_started_at.is_some() {
+            metadata.last_progress_at = stage_started_at;
+        }
         metadata.updated_at = SystemTime::now();
     }
 
@@ -148,7 +171,51 @@ impl RunCtx {
     pub async fn touch_stage_patch(&self) {
         let mut metadata = self.metadata.write().await;
         metadata.last_patch_at = Some(SystemTime::now());
+        metadata.last_progress_at = Some(SystemTime::now());
         metadata.updated_at = SystemTime::now();
+    }
+
+    pub async fn set_last_progress_at(&self, last_progress_at: Option<SystemTime>) {
+        let mut metadata = self.metadata.write().await;
+        metadata.last_progress_at = last_progress_at;
+        metadata.updated_at = SystemTime::now();
+    }
+
+    pub async fn touch_progress(&self) {
+        let mut metadata = self.metadata.write().await;
+        metadata.last_progress_at = Some(SystemTime::now());
+        metadata.updated_at = SystemTime::now();
+    }
+
+    pub async fn record_patch(&self, stage_id: &str) {
+        let mut metadata = self.metadata.write().await;
+        metadata.total_patch_count = metadata.total_patch_count.saturating_add(1);
+        let entry = metadata
+            .stage_patch_counts
+            .entry(stage_id.to_string())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+        let now = SystemTime::now();
+        metadata.last_progress_at = Some(now);
+        metadata.updated_at = now;
+    }
+
+    pub async fn total_patch_count(&self) -> u64 {
+        self.metadata.read().await.total_patch_count
+    }
+
+    pub async fn stage_patch_count(&self, stage_id: &str) -> u64 {
+        self.metadata
+            .read()
+            .await
+            .stage_patch_counts
+            .get(stage_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub async fn stage_patch_counts(&self) -> HashMap<String, u64> {
+        self.metadata.read().await.stage_patch_counts.clone()
     }
 
     pub async fn set_active_stage(
@@ -163,6 +230,7 @@ impl RunCtx {
             let now = SystemTime::now();
             metadata.stage_started_at = Some(now);
             metadata.last_patch_at = Some(now);
+            metadata.last_progress_at = Some(now);
         } else {
             metadata.stage_started_at = None;
             metadata.last_patch_at = None;
@@ -190,11 +258,13 @@ pub struct CreateRunInput {
     pub status: Option<RunStatus>,
     pub hash_bundle: Option<HashBundle>,
     pub stage_auto_commit: Option<StageAutoCommitPolicy>,
+    pub watchdog_policy: Option<WatchdogPolicy>,
     pub next_patch_seq: Option<u64>,
     pub active_stage_id: Option<String>,
     pub active_stage_expansion_policy: Option<ExpansionPolicy>,
     pub stage_started_at: Option<SystemTime>,
     pub last_patch_at: Option<SystemTime>,
+    pub last_progress_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -719,6 +789,7 @@ impl RunRegistry for InMemoryRunRegistry {
         let now = SystemTime::now();
         let mut stage_started_at = input.stage_started_at;
         let mut last_patch_at = input.last_patch_at;
+        let mut last_progress_at = input.last_progress_at;
         if input.active_stage_id.is_some() {
             if stage_started_at.is_none() {
                 stage_started_at = Some(now);
@@ -726,6 +797,12 @@ impl RunRegistry for InMemoryRunRegistry {
             if last_patch_at.is_none() {
                 last_patch_at = stage_started_at;
             }
+            if last_progress_at.is_none() {
+                last_progress_at = stage_started_at;
+            }
+        }
+        if last_progress_at.is_none() {
+            last_progress_at = Some(now);
         }
         let metadata = RunMetadata {
             created_at: now,
@@ -735,11 +812,15 @@ impl RunRegistry for InMemoryRunRegistry {
             experiment_id: input.experiment_id,
             variant_id: input.variant_id,
             stage_auto_commit: input.stage_auto_commit,
+            watchdog_policy: input.watchdog_policy,
             next_patch_seq: input.next_patch_seq.unwrap_or(0),
             active_stage_id: input.active_stage_id,
             active_stage_expansion_policy: input.active_stage_expansion_policy,
             stage_started_at,
             last_patch_at,
+            last_progress_at,
+            total_patch_count: 0,
+            stage_patch_counts: HashMap::new(),
         };
         let run_ctx = Arc::new(RunCtx::new(run_id.clone(), metadata));
 

@@ -11,7 +11,7 @@ use cork_proto::cork::v1::{
 };
 use cork_store::{
     ArtifactRef, EventLog, LogStore, NodeOutput, NodePayload, NodeSpec, RunCtx, RunRegistry,
-    StageAutoCommitPolicy, StateStore,
+    StageAutoCommitPolicy, StateStore, WatchdogPolicy,
 };
 use prost_types::Timestamp;
 use serde_json::Value;
@@ -116,6 +116,7 @@ pub struct ValidatedPolicy {
     pub scheduler_mode: SchedulerMode,
     pub scheduler_tie_break: SchedulerTieBreak,
     pub stage_auto_commit: StageAutoCommitPolicy,
+    pub watchdog: Option<WatchdogPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,11 +141,13 @@ pub fn validate_policy(value: &Value) -> Result<ValidatedPolicy, PolicyError> {
     let scheduler_mode = parse_scheduler_mode(value)?;
     let scheduler_tie_break = parse_scheduler_tie_break(value)?;
     let stage_auto_commit = parse_stage_auto_commit(value)?;
+    let watchdog = parse_watchdog(value)?;
     Ok(ValidatedPolicy {
         resource_pools,
         scheduler_mode,
         scheduler_tie_break,
         stage_auto_commit,
+        watchdog,
     })
 }
 
@@ -641,6 +644,29 @@ fn parse_stage_auto_commit(value: &Value) -> Result<StageAutoCommitPolicy, Polic
     })
 }
 
+fn parse_watchdog(value: &Value) -> Result<Option<WatchdogPolicy>, PolicyError> {
+    let Some(watchdog) = value.get("watchdog") else {
+        return Ok(None);
+    };
+    let watchdog = watchdog
+        .as_object()
+        .ok_or_else(|| PolicyError::Schema("watchdog must be object".to_string()))?;
+    let run_ttl_ms = watchdog.get("run_ttl_ms").and_then(|value| value.as_u64());
+    let idle_ttl_ms = watchdog.get("idle_ttl_ms").and_then(|value| value.as_u64());
+    let max_total_patch_count = watchdog
+        .get("max_total_patch_count")
+        .and_then(|value| value.as_u64());
+    let max_patch_count_per_stage = watchdog
+        .get("max_patch_count_per_stage")
+        .and_then(|value| value.as_u64());
+    Ok(Some(WatchdogPolicy {
+        run_ttl_ms,
+        idle_ttl_ms,
+        max_total_patch_count,
+        max_patch_count_per_stage,
+    }))
+}
+
 #[derive(Debug)]
 pub enum StartNodeError {
     MissingStageId,
@@ -653,6 +679,7 @@ pub struct StartNodeContext<'a> {
     pub node: &'a NodeSpec,
     pub node_states: &'a mut HashMap<String, NodeRuntimeState>,
     pub resource_manager: &'a ResourceManager,
+    pub run_ctx: Option<&'a RunCtx>,
     pub event_log: &'a dyn EventLog,
     pub log_store: &'a dyn LogStore,
     pub state_store: &'a dyn StateStore,
@@ -669,6 +696,7 @@ pub async fn start_ready_node(
         node,
         node_states,
         resource_manager,
+        run_ctx,
         event_log,
         log_store,
         state_store,
@@ -719,6 +747,7 @@ pub async fn start_ready_node(
         .await;
 
     append_node_state(
+        run_ctx,
         event_log,
         stage_id,
         &node.node_id,
@@ -739,6 +768,7 @@ pub async fn start_ready_node(
         run_id,
         stage_id,
         node_id: &node.node_id,
+        run_ctx,
         event_log,
         log_store,
         state_store,
@@ -837,6 +867,7 @@ fn parse_tool_input(value: Option<&Value>) -> Result<Option<Payload>, StartNodeE
 }
 
 async fn append_node_state(
+    run_ctx: Option<&RunCtx>,
     event_log: &dyn EventLog,
     stage_id: &str,
     node_id: &str,
@@ -856,6 +887,9 @@ async fn append_node_state(
         })),
     };
     event_log.append(event).await;
+    if let Some(run_ctx) = run_ctx {
+        run_ctx.touch_progress().await;
+    }
 }
 
 fn now_timestamp() -> Timestamp {
@@ -1623,6 +1657,7 @@ mod tests {
             node: &node,
             node_states: &mut node_states,
             resource_manager: &resource_manager,
+            run_ctx: None,
             event_log: &event_log,
             log_store: &log_store,
             state_store: &state_store,

@@ -1525,7 +1525,7 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 # P1: 運用耐性（長時間実行 / 失敗が日常の環境）
 
-## [ ] CORE-111: watchdog（TTL / idle / patch嵐 / 無限ループ検知）
+## [x] CORE-111: watchdog（TTL / idle / patch嵐 / 無限ループ検知）
 **Priority:** P1
 **Type:** Availability
 **Depends on:** CORE-112（推奨：ログ過多対策と相性）
@@ -1539,19 +1539,24 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - 進捗（progress）の定義: node state change / stage commit / patch applied 等
 
 **Subtasks**
-- [ ] policy に watchdog 設定を追加（後方互換: optional）
-- [ ] Supervisor tick で watchdog 判定
-- [ ] 閾値超えで CancelRun 相当を発火（reason付き）
-- [ ] テスト:
-  - [ ] idle_ttl 超過で cancel
-  - [ ] patch嵐で cancel
-  - [ ] stage open too long（max_open_ms）と整合
+- [x] policy に watchdog 設定を追加（後方互換: optional）
+- [x] Supervisor tick で watchdog 判定
+- [x] 閾値超えで CancelRun 相当を発火（reason付き）
+- [x] テスト:
+  - [x] idle_ttl 超過で cancel
+  - [x] patch嵐で cancel
+  - [x] stage open too long（max_open_ms）と整合
 
 **DoD**
 - “止まらないRun” が時間/回数で必ず止まる
 
 **Acceptance Criteria**
-- 指定TTLを越える Run が残り続けない
+- [x] 指定TTLを越える Run が残り続けない
+
+### 進捗
+- [DONE] watchdog policy と supervisor tick を追加し、Run の TTL/idle/patch 閾値で cancel するよう実装。
+  - 変更ファイル: `schemas/cork.policy.v0.1.schema.json`, `crates/cork-core/src/engine/watchdog.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-store/src/lib.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 
 ---
