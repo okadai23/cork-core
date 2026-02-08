@@ -324,12 +324,18 @@ fn bytes_to_sha256(bytes: &[u8; 32]) -> Sha256 {
     }
 }
 
-fn check_shutdown(state: &ShutdownState) -> Option<Status> {
-    if state.is_shutting_down() {
-        Some(Status::unavailable("server is shutting down"))
-    } else {
-        None
+fn check_shutdown(
+    state: &ShutdownState,
+    policy: &ShutdownPolicy,
+    allow_during_drain: bool,
+) -> Option<Status> {
+    if !state.is_shutting_down() {
+        return None;
     }
+    if allow_during_drain && policy.mode == ShutdownMode::Drain {
+        return None;
+    }
+    Some(Status::unavailable("server is shutting down"))
 }
 
 fn is_terminal(status: RunStatus) -> bool {
@@ -676,7 +682,7 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<SubmitRunRequest>,
     ) -> Result<Response<SubmitRunResponse>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, false) {
             return Err(status);
         }
         let request = request.into_inner();
@@ -791,7 +797,7 @@ impl CorkCore for CorkCoreService {
         &self,
         _request: Request<CancelRunRequest>,
     ) -> Result<Response<CancelRunResponse>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, false) {
             return Err(status);
         }
         Err(Status::unimplemented("CancelRun not yet implemented"))
@@ -801,7 +807,7 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<GetRunRequest>,
     ) -> Result<Response<GetRunResponse>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, false) {
             return Err(status);
         }
         let request = request.into_inner();
@@ -826,7 +832,7 @@ impl CorkCore for CorkCoreService {
         &self,
         _request: Request<ListRunsRequest>,
     ) -> Result<Response<ListRunsResponse>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, false) {
             return Err(status);
         }
         Err(Status::unimplemented("ListRuns not yet implemented"))
@@ -838,7 +844,7 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<StreamRunEventsRequest>,
     ) -> Result<Response<Self::StreamRunEventsStream>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, false) {
             return Err(status);
         }
         let request = request.into_inner();
@@ -900,7 +906,7 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<ApplyGraphPatchRequest>,
     ) -> Result<Response<ApplyGraphPatchResponse>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, true) {
             return Err(status);
         }
         let request = request.into_inner();
@@ -1044,7 +1050,7 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<GetCompositeGraphRequest>,
     ) -> Result<Response<GetCompositeGraphResponse>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, false) {
             return Err(status);
         }
         let request = request.into_inner();
@@ -1092,7 +1098,7 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<GetLogsRequest>,
     ) -> Result<Response<GetLogsResponse>, Status> {
-        if let Some(status) = check_shutdown(&self.shutdown_state) {
+        if let Some(status) = check_shutdown(&self.shutdown_state, &self.shutdown_policy, false) {
             return Err(status);
         }
         let request = request.into_inner();
