@@ -1555,7 +1555,11 @@ mod tests {
         let incoming = TcpListenerStream::new(listener);
         let handle = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(CorkWorkerServer::new(TestWorker))
+                .add_service(
+                    CorkWorkerServer::new(TestWorker)
+                        .max_decoding_message_size(crate::api::DEFAULT_GRPC_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(crate::api::DEFAULT_GRPC_MAX_MESSAGE_BYTES),
+                )
                 .serve_with_incoming(incoming)
                 .await
                 .expect("serve");

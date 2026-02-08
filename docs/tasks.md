@@ -1486,7 +1486,7 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 ---
 
-## [ ] CORE-150: 入力サイズ制限・クォータ（巨大JSON/巨大patchで落ちない）
+## [x] CORE-150: 入力サイズ制限・クォータ（巨大JSON/巨大patchで落ちない）
 **Priority:** P0
 **Type:** Security / Stability
 **Depends on:** CORE-103
@@ -1500,17 +1500,25 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - 1 stage あたりの max patch count（別タスク CORE-111 と連携）
 
 **Subtasks**
-- [ ] サーバ設定で gRPC message size 上限を設定（デフォルトを安全側に）
-- [ ] SubmitRun: contract/policy の最大サイズ・最大ステージ数制限
-- [ ] ApplyGraphPatch: ops数/ノード数/エッジ数制限
-- [ ] reject reason を体系化（CORE-043 に寄せる）
-- [ ] テスト（境界値: 上限-1/上限/上限+1）
+- [x] サーバ設定で gRPC message size 上限を設定（デフォルトを安全側に）
+- [x] SubmitRun: contract/policy の最大サイズ・最大ステージ数制限
+- [x] ApplyGraphPatch: ops数/ノード数/エッジ数制限
+- [x] reject reason を体系化（CORE-043 に寄せる）
+- [x] テスト（境界値: 上限-1/上限/上限+1）
 
 **DoD**
 - “巨大入力でプロセスが落ちない” がテストで担保される
 
 **Acceptance Criteria**
 - 上限超過時は必ず reject され、Run状態やストアが壊れない
+
+### 進捗
+- [DONE] gRPC message size と SubmitRun/ApplyGraphPatch の入力制限を追加し、境界値テストで検証。
+  - 変更ファイル: `crates/cork-core/src/api/core_service.rs`, `crates/cork-core/src/engine/patch.rs`, `crates/cork-core/src/main.rs`, `crates/cork-core/src/bin/corkctl.rs`, `crates/cork-core/src/engine/run.rs`, `crates/cork-core/src/worker/client.rs`, `crates/cork-core/tests/e2e_minimal.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] corkd の gRPC 送信メッセージサイズ上限を解除して、大容量レスポンスが失敗しないように調整。
+  - 変更ファイル: `crates/cork-core/src/main.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`。
 
 
 ---

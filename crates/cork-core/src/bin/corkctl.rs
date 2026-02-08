@@ -1,5 +1,5 @@
 use clap::Parser;
-use cork_core::api::CorkCoreService;
+use cork_core::api::{CorkCoreService, DEFAULT_GRPC_MAX_MESSAGE_BYTES};
 use cork_core::cli::{
     CanonicalKind, Cli, Command, apply_patch_request, canonicalize_json, get_run_request,
     payload_from_file, stream_events_request, submit_run_request,
@@ -19,7 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let service = CorkCoreService::new();
             println!("corkd starting on {}", addr);
             Server::builder()
-                .add_service(CorkCoreServer::new(service))
+                .add_service(
+                    CorkCoreServer::new(service)
+                        .max_decoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES),
+                )
                 .serve(addr)
                 .await?;
         }
