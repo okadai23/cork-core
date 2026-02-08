@@ -15,8 +15,8 @@ use cork_proto::cork::v1::cork_core_server::CorkCore;
 use cork_proto::cork::v1::cork_worker_server::{CorkWorker, CorkWorkerServer};
 use cork_proto::cork::v1::{
     ApplyGraphPatchRequest, CanonicalJsonDocument, GetCompositeGraphRequest, GetLogsRequest,
-    InvokeToolRequest, InvokeToolResponse, InvokeToolStreamChunk, LogRecord, Payload, RunHandle,
-    RunStatus, Sha256, StreamRunEventsRequest, SubmitRunRequest,
+    GetRunRequest, InvokeToolRequest, InvokeToolResponse, InvokeToolStreamChunk, LogRecord,
+    Payload, RunHandle, RunStatus, Sha256, StreamRunEventsRequest, SubmitRunRequest,
 };
 use cork_store::{InMemoryRunRegistry, RunRegistry};
 use serde_json::{Value, json};
@@ -633,4 +633,71 @@ async fn e2e_minimal_defaults_expansion_policy() {
         .expect("apply patch")
         .into_inner();
     assert!(patch_response.accepted);
+}
+
+#[tokio::test]
+async fn e2e_get_run_returns_policy_hash_bundle() {
+    let registry: Arc<dyn RunRegistry> = Arc::new(InMemoryRunRegistry::new());
+    let service = CorkCoreService::with_run_registry(Arc::clone(&registry));
+
+    let contract_json = build_contract_manifest();
+    let policy_json = build_policy();
+    let contract_doc = canonical_doc(contract_json, "cork.contract_manifest.v0.1");
+    let policy_doc = canonical_doc(policy_json, "cork.policy.v0.1");
+
+    let submit_response = service
+        .submit_run(Request::new(SubmitRunRequest {
+            contract_manifest: Some(contract_doc),
+            policy: Some(policy_doc.clone()),
+            initial_input: Some(Payload {
+                content_type: "application/json".to_string(),
+                data: br#"{}"#.to_vec(),
+                encoding: "".to_string(),
+                sha256: None,
+            }),
+            experiment_id: "exp-policy".to_string(),
+            variant_id: "var-policy".to_string(),
+            trace_context: None,
+        }))
+        .await
+        .expect("submit run")
+        .into_inner();
+    let handle = submit_response.handle.expect("handle");
+
+    let get_response = service
+        .get_run(Request::new(GetRunRequest {
+            handle: Some(handle.clone()),
+        }))
+        .await
+        .expect("get run")
+        .into_inner();
+    let policy = get_response.policy.expect("policy");
+    assert_eq!(policy.schema_id, "cork.policy.v0.1");
+    assert_eq!(policy.sha256, policy_doc.sha256);
+
+    let run_policy_hash = get_response
+        .hashes
+        .as_ref()
+        .and_then(|hashes| hashes.policy_hash.as_ref())
+        .expect("run policy hash");
+    let submit_policy_hash = submit_response
+        .hashes
+        .as_ref()
+        .and_then(|hashes| hashes.policy_hash.as_ref())
+        .expect("submit policy hash");
+    assert_eq!(run_policy_hash.bytes32, submit_policy_hash.bytes32);
+
+    let composite_response = service
+        .get_composite_graph(Request::new(GetCompositeGraphRequest {
+            handle: Some(handle),
+        }))
+        .await
+        .expect("get composite graph")
+        .into_inner();
+    let composite_policy_hash = composite_response
+        .hashes
+        .as_ref()
+        .and_then(|hashes| hashes.policy_hash.as_ref())
+        .expect("composite policy hash");
+    assert_eq!(composite_policy_hash.bytes32, submit_policy_hash.bytes32);
 }

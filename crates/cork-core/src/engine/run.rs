@@ -32,6 +32,7 @@ pub async fn run_ctx_to_response(run_ctx: &Arc<RunCtx>) -> GetRunResponse {
         updated_at: Some(system_time_to_timestamp(metadata.updated_at)),
         hashes: metadata.hash_bundle,
         active_stage_id: metadata.active_stage_id.unwrap_or_default(),
+        policy: None,
     }
 }
 

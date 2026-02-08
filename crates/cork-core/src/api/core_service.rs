@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::patch::{PatchRejectReason, commit_graph_patch, validate_graph_patch};
-use crate::engine::run::{node_stage_id, validate_contract_manifest, validate_policy};
+use crate::engine::run::{
+    node_stage_id, run_ctx_to_response, validate_contract_manifest, validate_policy,
+};
 use cork_hash::{composite_graph_hash, contract_hash, patch_hash, policy_hash, sha256};
 use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
@@ -518,6 +520,7 @@ impl CorkCore for CorkCoreService {
             .await;
         self.patch_store
             .set_contract_manifest(run_ctx.run_id(), contract);
+        self.patch_store.set_policy(run_ctx.run_id(), policy);
         Ok(Response::new(SubmitRunResponse {
             handle: Some(RunHandle {
                 run_id: run_ctx.run_id().to_string(),
@@ -538,9 +541,24 @@ impl CorkCore for CorkCoreService {
 
     async fn get_run(
         &self,
-        _request: Request<GetRunRequest>,
+        request: Request<GetRunRequest>,
     ) -> Result<Response<GetRunResponse>, Status> {
-        Err(Status::unimplemented("GetRun not yet implemented"))
+        let request = request.into_inner();
+        let handle = request
+            .handle
+            .ok_or_else(|| Status::invalid_argument("missing run handle"))?;
+        if handle.run_id.is_empty() {
+            return Err(Status::invalid_argument("missing run_id"));
+        }
+        let run_ctx = self
+            .run_registry
+            .get_run(&handle.run_id)
+            .await
+            .ok_or_else(|| Status::not_found("run not found"))?;
+        let policy = self.patch_store.policy(&handle.run_id);
+        let mut response = run_ctx_to_response(&run_ctx).await;
+        response.policy = policy;
+        Ok(Response::new(response))
     }
 
     async fn list_runs(

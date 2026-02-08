@@ -49,6 +49,7 @@ message GetRunResponse {
   google.protobuf.Timestamp updated_at = 4;
   HashBundle hashes = 5;
   string active_stage_id = 10;
+  CanonicalJsonDocument policy = 11;
 }
 
 message ListRunsRequest {

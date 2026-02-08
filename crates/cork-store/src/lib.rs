@@ -228,6 +228,8 @@ pub enum PatchStoreError {
 pub trait PatchStore: Send + Sync {
     fn set_contract_manifest(&self, run_id: &str, contract: CanonicalJsonDocument);
     fn contract_manifest(&self, run_id: &str) -> Option<CanonicalJsonDocument>;
+    fn set_policy(&self, run_id: &str, policy: CanonicalJsonDocument);
+    fn policy(&self, run_id: &str) -> Option<CanonicalJsonDocument>;
     fn append_patch(
         &self,
         run_id: &str,
@@ -245,6 +247,7 @@ pub struct InMemoryPatchStore {
 #[derive(Debug, Default)]
 struct PatchState {
     contract_manifest: Option<CanonicalJsonDocument>,
+    policy: Option<CanonicalJsonDocument>,
     patches: Vec<CanonicalJsonDocument>,
 }
 
@@ -264,6 +267,15 @@ impl PatchStore for InMemoryPatchStore {
         self.runs
             .get(run_id)
             .and_then(|state| state.contract_manifest.clone())
+    }
+
+    fn set_policy(&self, run_id: &str, policy: CanonicalJsonDocument) {
+        let mut state = self.runs.entry(run_id.to_string()).or_default();
+        state.policy = Some(policy);
+    }
+
+    fn policy(&self, run_id: &str) -> Option<CanonicalJsonDocument> {
+        self.runs.get(run_id).and_then(|state| state.policy.clone())
     }
 
     fn append_patch(
