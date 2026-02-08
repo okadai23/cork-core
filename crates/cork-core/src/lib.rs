@@ -15,4 +15,5 @@ pub mod api;
 pub mod cli;
 pub mod engine;
 pub mod scheduler;
+pub mod shutdown;
 pub mod worker;

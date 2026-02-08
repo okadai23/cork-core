@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use cork_core::api::{CorkCoreService, DEFAULT_GRPC_MAX_MESSAGE_BYTES};
+use cork_core::api::{CorkCoreService, CorkCoreServiceConfig, DEFAULT_GRPC_MAX_MESSAGE_BYTES};
 use cork_core::engine::autocommit::tick_stage_auto_commit;
 use cork_core::engine::run::{
     NodeRuntimeState, NodeRuntimeStatus, StageRuntimeState, StageRuntimeStatus,
     validate_contract_manifest,
 };
+use cork_core::shutdown::{ShutdownMode, ShutdownPolicy};
 use cork_core::worker::client::{InvocationBudget, InvocationContext, WorkerClient};
 use cork_hash::{composite_graph_hash, contract_hash, patch_hash, sha256};
 use cork_proto::cork::v1::cork_core_server::CorkCore;
@@ -20,9 +21,9 @@ use cork_proto::cork::v1::{
     Payload, RunHandle, RunStatus, Sha256, StreamRunEventsRequest, SubmitRunRequest,
 };
 use cork_store::{
-    CircuitBreakerPolicy, EventLog, InMemoryEventLog, InMemoryLogStore, InMemoryRunRegistry,
-    InMemoryStateStore, RetryBackoff, RetryBackoffPolicy, RetryJitter, RunRegistry, WorkerPolicy,
-    WorkerRetryPolicy,
+    CircuitBreakerPolicy, CreateRunInput, EventLog, InMemoryEventLog, InMemoryLogStore,
+    InMemoryRunRegistry, InMemoryStateStore, RetryBackoff, RetryBackoffPolicy, RetryJitter,
+    RunRegistry, WorkerPolicy, WorkerRetryPolicy,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -866,6 +867,36 @@ async fn worker_retry_recovers_from_temporary_failure() {
     )));
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn shutdown_cancels_active_runs_and_emits_policy_event() {
+    let service = CorkCoreService::with_config(CorkCoreServiceConfig {
+        shutdown_policy: ShutdownPolicy {
+            mode: ShutdownMode::Cancel,
+            drain_timeout: Duration::from_millis(1),
+        },
+        ..CorkCoreServiceConfig::default()
+    });
+    let run = service
+        .create_run(CreateRunInput {
+            status: Some(RunStatus::RunRunning),
+            ..Default::default()
+        })
+        .await;
+    let event_log = service.event_log_for_run(run.run_id());
+
+    service.handle_shutdown().await;
+
+    let metadata = run.metadata().await;
+    assert_eq!(metadata.status, RunStatus::RunCancelled);
+    let events = event_log.subscribe(0).await.expect("subscribe").backlog;
+    assert!(events.iter().any(|event| matches!(
+        event.event.as_ref(),
+        Some(cork_proto::cork::v1::run_event::Event::Policy(
+            cork_proto::cork::v1::PolicyEvent { kind, .. }
+        )) if kind == "shutdown_cancel"
+    )));
 }
 
 #[tokio::test]
