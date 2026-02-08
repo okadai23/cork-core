@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::patch::{PatchRejectReason, apply_graph_patch_ops};
+use crate::engine::patch::{PatchRejectReason, commit_graph_patch, validate_graph_patch};
 use crate::engine::run::{node_stage_id, validate_contract_manifest, validate_policy};
 use cork_hash::{composite_graph_hash, contract_hash, patch_hash, policy_hash, sha256};
 use cork_proto::cork::v1::run_event;
@@ -675,9 +675,17 @@ impl CorkCore for CorkCoreService {
             Ok(stage_touch) => stage_touch,
             Err(reason) => return Ok(Response::new(reject_response(reason))),
         };
-        if let Err(err) = apply_graph_patch_ops(
+        let validated = match validate_graph_patch(
             run_ctx.run_id(),
             &patch,
+            self.graph_store.as_ref(),
+            self.state_store.as_ref(),
+        ) {
+            Ok(validated) => validated,
+            Err(err) => return Ok(Response::new(reject_response(err.reject_reason()))),
+        };
+        if let Err(err) = commit_graph_patch(
+            validated,
             self.graph_store.as_ref(),
             self.state_store.as_ref(),
         ) {
@@ -1253,7 +1261,7 @@ mod tests {
         let patch =
             build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("TOOL")]));
         let request = ApplyGraphPatchRequest {
-            handle: Some(handle),
+            handle: Some(handle.clone()),
             patch: Some(patch),
             actor_id: String::new(),
         };
@@ -1264,6 +1272,7 @@ mod tests {
             .expect("apply response")
             .into_inner();
         assert!(!response.accepted);
+        assert!(service.graph_store.node(&handle.run_id, "node-1").is_none());
         assert!(
             response.rejection_reason.contains("node kind not allowed"),
             "unexpected rejection reason: {}",
@@ -1281,7 +1290,7 @@ mod tests {
             json!([node_added_tool_op("EXTERNAL_WRITE", None)]),
         );
         let request = ApplyGraphPatchRequest {
-            handle: Some(handle),
+            handle: Some(handle.clone()),
             patch: Some(patch),
             actor_id: String::new(),
         };
@@ -1292,6 +1301,12 @@ mod tests {
             .expect("apply response")
             .into_inner();
         assert!(!response.accepted);
+        assert!(
+            service
+                .graph_store
+                .node(&handle.run_id, "node-tool-1")
+                .is_none()
+        );
         assert!(
             response
                 .rejection_reason
@@ -1339,7 +1354,7 @@ mod tests {
             json!([state_put_op("RUN", None, "invalid", json!(1))]),
         );
         let request = ApplyGraphPatchRequest {
-            handle: Some(handle),
+            handle: Some(handle.clone()),
             patch: Some(patch),
             actor_id: String::new(),
         };
@@ -1350,6 +1365,13 @@ mod tests {
             .expect("apply response")
             .into_inner();
         assert!(!response.accepted);
+        assert!(service.state_store.run_state(&handle.run_id).is_none());
+        assert!(
+            service
+                .patch_store
+                .patches_in_order(&handle.run_id)
+                .is_empty()
+        );
         assert!(
             response.rejection_reason.contains("invalid json pointer"),
             "unexpected rejection reason: {}",
@@ -1370,7 +1392,7 @@ mod tests {
             ]),
         );
         let request = ApplyGraphPatchRequest {
-            handle: Some(handle),
+            handle: Some(handle.clone()),
             patch: Some(patch),
             actor_id: String::new(),
         };
@@ -1381,6 +1403,13 @@ mod tests {
             .expect("apply response")
             .into_inner();
         assert!(!response.accepted);
+        assert!(service.graph_store.node(&handle.run_id, "node-a").is_none());
+        assert!(
+            service
+                .patch_store
+                .patches_in_order(&handle.run_id)
+                .is_empty()
+        );
         assert!(
             response.rejection_reason.contains("unknown node_id"),
             "unexpected rejection reason: {}",
@@ -1418,6 +1447,54 @@ mod tests {
             response.rejection_reason.contains("cycle detected"),
             "unexpected rejection reason: {}",
             response.rejection_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_reject_then_accept_does_not_corrupt_state() {
+        let (service, handle) = setup_service_with_run("stage-a", true, vec!["LLM"], 0).await;
+        let invalid_patch = build_patch_document(
+            &handle.run_id,
+            0,
+            "stage-a",
+            json!([state_put_op("RUN", None, "invalid", json!(1))]),
+        );
+        let invalid_request = ApplyGraphPatchRequest {
+            handle: Some(handle.clone()),
+            patch: Some(invalid_patch),
+            actor_id: String::new(),
+        };
+        let invalid_response = service
+            .apply_graph_patch(Request::new(invalid_request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(!invalid_response.accepted);
+        assert!(service.state_store.run_state(&handle.run_id).is_none());
+        assert!(
+            service
+                .patch_store
+                .patches_in_order(&handle.run_id)
+                .is_empty()
+        );
+
+        let valid_patch =
+            build_patch_document(&handle.run_id, 0, "stage-a", json!([node_added_op("LLM")]));
+        let valid_request = ApplyGraphPatchRequest {
+            handle: Some(handle.clone()),
+            patch: Some(valid_patch),
+            actor_id: String::new(),
+        };
+        let valid_response = service
+            .apply_graph_patch(Request::new(valid_request))
+            .await
+            .expect("apply response")
+            .into_inner();
+        assert!(valid_response.accepted);
+        assert!(service.graph_store.node(&handle.run_id, "node-1").is_some());
+        assert_eq!(
+            service.patch_store.patches_in_order(&handle.run_id).len(),
+            1
         );
     }
 
