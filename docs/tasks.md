@@ -1563,7 +1563,7 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 ---
 
-## [ ] CORE-113: Worker呼び出しの resilience（timeout / retry / backoff / circuit breaker）
+## [x] CORE-113: Worker呼び出しの resilience（timeout / retry / backoff / circuit breaker）
 **Priority:** P1
 **Type:** Reliability
 **Depends on:** CORE-101
@@ -1577,18 +1577,29 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - circuit breaker（一定時間 fail-fast）
 
 **Subtasks**
-- [ ] エラー分類（retryable / non-retryable）を導入
-- [ ] retry policy を policy 側から設定可能に（デフォルトも用意）
-- [ ] circuit breaker 状態を run event として出す（可観測に）
-- [ ] 統合テスト:
-  - [ ] Workerが一時的に落ちる → retryで回復
-  - [ ] 永続失敗 → 最終的にFAILED
+- [x] エラー分類（retryable / non-retryable）を導入
+- [x] retry policy を policy 側から設定可能に（デフォルトも用意）
+- [x] circuit breaker 状態を run event として出す（可観測に）
+- [x] 統合テスト:
+  - [x] Workerが一時的に落ちる → retryで回復
+  - [x] 永続失敗 → 最終的にFAILED
 
 **DoD**
 - 失敗時の state 遷移が一貫し、理由がログに残る
 
 **Acceptance Criteria**
-- Worker障害で corkd がハングしない
+- [x] Worker障害で corkd がハングしない
+
+### 進捗
+- [DONE] Worker呼び出しのtimeout/retry/backoff/circuit breakerを実装し、policy設定とrun event出力を追加。
+  - 変更ファイル: `crates/cork-core/src/worker/client.rs`, `crates/cork-core/src/engine/run.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-store/src/lib.rs`, `schemas/cork.policy.v0.1.schema.json`, `crates/cork-canon/src/lib.rs`, `docs/canonicalization.md`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] Workerの一時障害/永続障害の統合テストを追加。
+  - 変更ファイル: `crates/cork-core/tests/e2e_minimal.rs`。
+  - 検証: `make test`。
+- [DONE] ストリーミング中断エラーをretry/breaker経路へ流す修正を追加。
+  - 変更ファイル: `crates/cork-core/src/worker/client.rs`。
+  - 検証: `make test`。
 
 
 ---

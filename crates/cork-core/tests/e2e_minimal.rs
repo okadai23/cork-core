@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use cork_core::api::{CorkCoreService, DEFAULT_GRPC_MAX_MESSAGE_BYTES};
@@ -18,7 +19,11 @@ use cork_proto::cork::v1::{
     GetRunRequest, InvokeToolRequest, InvokeToolResponse, InvokeToolStreamChunk, LogRecord,
     Payload, RunHandle, RunStatus, Sha256, StreamRunEventsRequest, SubmitRunRequest,
 };
-use cork_store::{InMemoryRunRegistry, RunRegistry};
+use cork_store::{
+    CircuitBreakerPolicy, EventLog, InMemoryEventLog, InMemoryLogStore, InMemoryRunRegistry,
+    InMemoryStateStore, RetryBackoff, RetryBackoffPolicy, RetryJitter, RunRegistry, WorkerPolicy,
+    WorkerRetryPolicy,
+};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
@@ -124,6 +129,115 @@ async fn start_worker_server() -> (tonic::transport::Channel, tokio::task::JoinH
         .await
         .expect("worker connect");
     (channel, handle)
+}
+
+struct FlakyWorker {
+    remaining_failures: Arc<AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl CorkWorker for FlakyWorker {
+    async fn health(
+        &self,
+        _request: Request<cork_proto::cork::v1::HealthRequest>,
+    ) -> Result<Response<cork_proto::cork::v1::HealthResponse>, Status> {
+        Ok(Response::new(cork_proto::cork::v1::HealthResponse {
+            status: "ok".to_string(),
+            worker_id: "worker-flaky".to_string(),
+        }))
+    }
+
+    async fn invoke_tool(
+        &self,
+        _request: Request<InvokeToolRequest>,
+    ) -> Result<Response<InvokeToolResponse>, Status> {
+        Err(Status::unavailable("not implemented"))
+    }
+
+    type InvokeToolStreamStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<InvokeToolStreamChunk, Status>> + Send>>;
+
+    async fn invoke_tool_stream(
+        &self,
+        _request: Request<InvokeToolRequest>,
+    ) -> Result<Response<Self::InvokeToolStreamStream>, Status> {
+        let remaining = self
+            .remaining_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if remaining > 0 {
+            return Err(Status::unavailable("temporary outage"));
+        }
+        let response = InvokeToolResponse {
+            output: Some(Payload {
+                content_type: "application/json".to_string(),
+                data: br#"{"ok":true}"#.to_vec(),
+                encoding: "".to_string(),
+                sha256: None,
+            }),
+            artifacts: Vec::new(),
+            error_code: "".to_string(),
+            error_message: "".to_string(),
+        };
+        let chunks = vec![Ok(InvokeToolStreamChunk {
+            ts: None,
+            chunk: Some(cork_proto::cork::v1::invoke_tool_stream_chunk::Chunk::Final(response)),
+        })];
+        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+    }
+}
+
+async fn start_flaky_worker(
+    failures: usize,
+) -> (tonic::transport::Channel, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
+    let addr = listener.local_addr().expect("worker addr");
+    let incoming = TcpListenerStream::new(listener);
+    let remaining_failures = Arc::new(AtomicUsize::new(failures));
+    let worker = FlakyWorker { remaining_failures };
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                CorkWorkerServer::new(worker)
+                    .max_decoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES),
+            )
+            .serve_with_incoming(incoming)
+            .await
+            .expect("serve worker");
+    });
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("worker channel")
+        .connect()
+        .await
+        .expect("worker connect");
+    (channel, handle)
+}
+
+fn test_worker_policy(max_attempts: u32) -> WorkerPolicy {
+    WorkerPolicy {
+        timeout_ms: Some(5_000),
+        retry: WorkerRetryPolicy {
+            max_attempts,
+            backoff: RetryBackoff {
+                policy: RetryBackoffPolicy::Exponential,
+                base_delay_ms: 1,
+                max_delay_ms: 5,
+                jitter: RetryJitter::None,
+            },
+            retry_on: vec![
+                cork_store::WorkerRetryCondition::GrpcUnavailable,
+                cork_store::WorkerRetryCondition::Timeout,
+            ],
+            circuit_breaker: CircuitBreakerPolicy {
+                enabled: false,
+                open_after_failures: 3,
+                half_open_after_ms: 1_000,
+            },
+        },
+    }
 }
 
 fn build_sha256(bytes: &[u8; 32]) -> Sha256 {
@@ -445,6 +559,7 @@ async fn e2e_submit_patch_execute_commit() {
         state_store: state_store.as_ref(),
         budget: InvocationBudget::default(),
         trace_context: None,
+        worker_policy: None,
     };
     let invoke_request = InvokeToolRequest {
         invocation_id: "inv-1".to_string(),
@@ -705,4 +820,93 @@ async fn e2e_get_run_returns_policy_hash_bundle() {
         .and_then(|hashes| hashes.policy_hash.as_ref())
         .expect("composite policy hash");
     assert_eq!(composite_policy_hash.bytes32, submit_policy_hash.bytes32);
+}
+
+#[tokio::test]
+async fn worker_retry_recovers_from_temporary_failure() {
+    let (channel, handle) = start_flaky_worker(2).await;
+    let mut client = WorkerClient::new(channel);
+    let event_log = InMemoryEventLog::new();
+    let log_store = InMemoryLogStore::new();
+    let state_store = InMemoryStateStore::new();
+    let context = InvocationContext {
+        run_id: "run-retry-1",
+        stage_id: "stage-retry",
+        node_id: "stage-retry/node-retry",
+        run_ctx: None,
+        event_log: &event_log,
+        log_store: &log_store,
+        state_store: &state_store,
+        budget: InvocationBudget::default(),
+        trace_context: None,
+        worker_policy: Some(test_worker_policy(4)),
+    };
+    let request = InvokeToolRequest {
+        invocation_id: "inv-retry-1".to_string(),
+        tool_name: "tool".to_string(),
+        tool_version: "v1".to_string(),
+        input: None,
+        deadline: None,
+        idempotency_key: "".to_string(),
+        trace_context: None,
+    };
+
+    let response = client
+        .invoke_tool_stream(request, &context)
+        .await
+        .expect("retry success");
+    assert!(response.output.is_some());
+
+    let events = event_log.subscribe(0).await.expect("subscribe").backlog;
+    assert!(events.iter().any(|event| matches!(
+        event.event.as_ref(),
+        Some(cork_proto::cork::v1::run_event::Event::NodeState(
+            cork_proto::cork::v1::NodeStateChanged { new_status, .. }
+        )) if *new_status == cork_proto::cork::v1::NodeStatus::NodeSucceeded as i32
+    )));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn worker_retry_fails_after_exhaustion() {
+    let (channel, handle) = start_flaky_worker(10).await;
+    let mut client = WorkerClient::new(channel);
+    let event_log = InMemoryEventLog::new();
+    let log_store = InMemoryLogStore::new();
+    let state_store = InMemoryStateStore::new();
+    let context = InvocationContext {
+        run_id: "run-retry-2",
+        stage_id: "stage-retry",
+        node_id: "stage-retry/node-retry",
+        run_ctx: None,
+        event_log: &event_log,
+        log_store: &log_store,
+        state_store: &state_store,
+        budget: InvocationBudget::default(),
+        trace_context: None,
+        worker_policy: Some(test_worker_policy(2)),
+    };
+    let request = InvokeToolRequest {
+        invocation_id: "inv-retry-2".to_string(),
+        tool_name: "tool".to_string(),
+        tool_version: "v1".to_string(),
+        input: None,
+        deadline: None,
+        idempotency_key: "".to_string(),
+        trace_context: None,
+    };
+
+    let result = client.invoke_tool_stream(request, &context).await;
+    assert!(result.is_err());
+
+    let events = event_log.subscribe(0).await.expect("subscribe").backlog;
+    assert!(events.iter().any(|event| matches!(
+        event.event.as_ref(),
+        Some(cork_proto::cork::v1::run_event::Event::NodeState(
+            cork_proto::cork::v1::NodeStateChanged { new_status, .. }
+        )) if *new_status == cork_proto::cork::v1::NodeStatus::NodeFailed as i32
+    )));
+
+    handle.abort();
 }

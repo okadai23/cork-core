@@ -43,6 +43,13 @@ pub fn prenorm_policy(mut value: Value) -> Value {
             sort_array_strings(retry_on);
         }
 
+        if let Some(Value::Object(worker)) = root.get_mut("worker")
+            && let Some(Value::Object(retry)) = worker.get_mut("retry")
+            && let Some(Value::Array(retry_on)) = retry.get_mut("retry_on")
+        {
+            sort_array_strings(retry_on);
+        }
+
         if let Some(Value::Object(cache)) = root.get_mut("cache")
             && let Some(Value::Array(rules)) = cache.get_mut("rules")
         {

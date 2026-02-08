@@ -10,8 +10,9 @@ use cork_proto::cork::v1::{
     RunHandle, RunStatus, TraceContext,
 };
 use cork_store::{
-    ArtifactRef, EventLog, LogStore, NodeOutput, NodePayload, NodeSpec, RunCtx, RunRegistry,
-    StageAutoCommitPolicy, StateStore, WatchdogPolicy,
+    ArtifactRef, CircuitBreakerPolicy, EventLog, LogStore, NodeOutput, NodePayload, NodeSpec,
+    RetryBackoff, RetryBackoffPolicy, RetryJitter, RunCtx, RunRegistry, StageAutoCommitPolicy,
+    StateStore, WatchdogPolicy, WorkerPolicy, WorkerRetryCondition, WorkerRetryPolicy,
 };
 use prost_types::Timestamp;
 use serde_json::Value;
@@ -117,6 +118,7 @@ pub struct ValidatedPolicy {
     pub scheduler_tie_break: SchedulerTieBreak,
     pub stage_auto_commit: StageAutoCommitPolicy,
     pub watchdog: Option<WatchdogPolicy>,
+    pub worker: WorkerPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,12 +144,14 @@ pub fn validate_policy(value: &Value) -> Result<ValidatedPolicy, PolicyError> {
     let scheduler_tie_break = parse_scheduler_tie_break(value)?;
     let stage_auto_commit = parse_stage_auto_commit(value)?;
     let watchdog = parse_watchdog(value)?;
+    let worker = parse_worker_policy(value)?;
     Ok(ValidatedPolicy {
         resource_pools,
         scheduler_mode,
         scheduler_tie_break,
         stage_auto_commit,
         watchdog,
+        worker,
     })
 }
 
@@ -644,6 +648,156 @@ fn parse_stage_auto_commit(value: &Value) -> Result<StageAutoCommitPolicy, Polic
     })
 }
 
+fn parse_worker_policy(value: &Value) -> Result<WorkerPolicy, PolicyError> {
+    let Some(worker) = value.get("worker") else {
+        return Ok(WorkerPolicy::default());
+    };
+    let timeout_ms = worker
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .map(Some)
+        .unwrap_or(None);
+    let retry = parse_worker_retry(worker)?;
+    Ok(WorkerPolicy { timeout_ms, retry })
+}
+
+fn parse_worker_retry(worker: &Value) -> Result<WorkerRetryPolicy, PolicyError> {
+    let retry = worker
+        .get("retry")
+        .ok_or_else(|| PolicyError::Schema("worker.retry is missing".to_string()))?;
+    let max_attempts = retry
+        .get("max_attempts")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| PolicyError::Schema("worker.retry.max_attempts is missing".to_string()))?;
+    let backoff = parse_worker_retry_backoff(retry)?;
+    let retry_on = parse_worker_retry_on(retry)?;
+    let circuit_breaker = parse_worker_circuit_breaker(retry)?;
+    Ok(WorkerRetryPolicy {
+        max_attempts: max_attempts as u32,
+        backoff,
+        retry_on,
+        circuit_breaker,
+    })
+}
+
+fn parse_worker_retry_backoff(retry: &Value) -> Result<RetryBackoff, PolicyError> {
+    let backoff = retry
+        .get("backoff")
+        .ok_or_else(|| PolicyError::Schema("worker.retry.backoff is missing".to_string()))?;
+    let policy = backoff
+        .get("policy")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PolicyError::Schema("worker.retry.backoff.policy is missing".to_string()))?;
+    let policy = match policy {
+        "EXPONENTIAL" => RetryBackoffPolicy::Exponential,
+        "LINEAR" => RetryBackoffPolicy::Linear,
+        "CONSTANT" => RetryBackoffPolicy::Constant,
+        other => {
+            return Err(PolicyError::Schema(format!(
+                "worker.retry.backoff.policy unsupported: {other}"
+            )));
+        }
+    };
+    let base_delay_ms = backoff
+        .get("base_delay_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PolicyError::Schema("worker.retry.backoff.base_delay_ms is missing".to_string())
+        })?;
+    let max_delay_ms = backoff
+        .get("max_delay_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PolicyError::Schema("worker.retry.backoff.max_delay_ms is missing".to_string())
+        })?;
+    let jitter = backoff
+        .get("jitter")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PolicyError::Schema("worker.retry.backoff.jitter is missing".to_string()))?;
+    let jitter = match jitter {
+        "NONE" => RetryJitter::None,
+        "FULL" => RetryJitter::Full,
+        "EQUAL" => RetryJitter::Equal,
+        other => {
+            return Err(PolicyError::Schema(format!(
+                "worker.retry.backoff.jitter unsupported: {other}"
+            )));
+        }
+    };
+    Ok(RetryBackoff {
+        policy,
+        base_delay_ms,
+        max_delay_ms,
+        jitter,
+    })
+}
+
+fn parse_worker_retry_on(retry: &Value) -> Result<Vec<WorkerRetryCondition>, PolicyError> {
+    let retry_on = retry
+        .get("retry_on")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PolicyError::Schema("worker.retry.retry_on is missing".to_string()))?;
+    let mut values = Vec::with_capacity(retry_on.len());
+    for value in retry_on {
+        let Some(value) = value.as_str() else {
+            return Err(PolicyError::Schema(
+                "worker.retry.retry_on entries must be strings".to_string(),
+            ));
+        };
+        let condition = match value {
+            "TIMEOUT" => WorkerRetryCondition::Timeout,
+            "TRANSIENT_NETWORK" => WorkerRetryCondition::TransientNetwork,
+            "GRPC_UNAVAILABLE" => WorkerRetryCondition::GrpcUnavailable,
+            "GRPC_DEADLINE_EXCEEDED" => WorkerRetryCondition::GrpcDeadlineExceeded,
+            "GRPC_RESOURCE_EXHAUSTED" => WorkerRetryCondition::GrpcResourceExhausted,
+            "GRPC_ABORTED" => WorkerRetryCondition::GrpcAborted,
+            "GRPC_CANCELLED" => WorkerRetryCondition::GrpcCancelled,
+            "GRPC_UNKNOWN" => WorkerRetryCondition::GrpcUnknown,
+            "GRPC_INTERNAL" => WorkerRetryCondition::GrpcInternal,
+            other => {
+                return Err(PolicyError::Schema(format!(
+                    "worker.retry.retry_on unsupported: {other}"
+                )));
+            }
+        };
+        values.push(condition);
+    }
+    Ok(values)
+}
+
+fn parse_worker_circuit_breaker(retry: &Value) -> Result<CircuitBreakerPolicy, PolicyError> {
+    let circuit = retry.get("circuit_breaker").ok_or_else(|| {
+        PolicyError::Schema("worker.retry.circuit_breaker is missing".to_string())
+    })?;
+    let enabled = circuit
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            PolicyError::Schema("worker.retry.circuit_breaker.enabled is missing".to_string())
+        })?;
+    let open_after_failures = circuit
+        .get("open_after_failures")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PolicyError::Schema(
+                "worker.retry.circuit_breaker.open_after_failures is missing".to_string(),
+            )
+        })?;
+    let half_open_after_ms = circuit
+        .get("half_open_after_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PolicyError::Schema(
+                "worker.retry.circuit_breaker.half_open_after_ms is missing".to_string(),
+            )
+        })?;
+    Ok(CircuitBreakerPolicy {
+        enabled,
+        open_after_failures: open_after_failures as u32,
+        half_open_after_ms,
+    })
+}
+
 fn parse_watchdog(value: &Value) -> Result<Option<WatchdogPolicy>, PolicyError> {
     let Some(watchdog) = value.get("watchdog") else {
         return Ok(None);
@@ -764,6 +918,11 @@ pub async fn start_ready_node(
         },
     );
 
+    let worker_policy = if let Some(run_ctx) = run_ctx {
+        run_ctx.worker_policy().await
+    } else {
+        None
+    };
     let invocation = InvocationContext {
         run_id,
         stage_id,
@@ -774,6 +933,7 @@ pub async fn start_ready_node(
         state_store,
         budget,
         trace_context,
+        worker_policy,
     };
     let request = build_tool_request(run_id, node)?;
     let result = match worker.invoke_tool_stream(request, &invocation).await {
@@ -1524,6 +1684,40 @@ mod tests {
             result,
             Err(PolicyError::UnsupportedSchedulerMode(mode)) if mode == "OPTIMIZE_CP_SAT"
         ));
+    }
+
+    #[test]
+    fn validate_policy_parses_worker_policy() {
+        let mut policy = build_policy();
+        policy["worker"] = json!({
+            "timeout_ms": 2500,
+            "retry": {
+                "max_attempts": 4,
+                "backoff": {
+                    "policy": "EXPONENTIAL",
+                    "base_delay_ms": 10,
+                    "max_delay_ms": 100,
+                    "jitter": "FULL"
+                },
+                "retry_on": ["TIMEOUT", "GRPC_UNAVAILABLE"],
+                "circuit_breaker": {
+                    "enabled": true,
+                    "open_after_failures": 2,
+                    "half_open_after_ms": 200
+                }
+            }
+        });
+        let validated = validate_policy(&policy).expect("valid policy");
+        assert_eq!(validated.worker.timeout_ms, Some(2500));
+        assert_eq!(validated.worker.retry.max_attempts, 4);
+        assert_eq!(
+            validated.worker.retry.retry_on,
+            vec![
+                WorkerRetryCondition::Timeout,
+                WorkerRetryCondition::GrpcUnavailable
+            ]
+        );
+        assert!(validated.worker.retry.circuit_breaker.enabled);
     }
 
     struct TestWorker;
