@@ -1557,6 +1557,8 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - [DONE] watchdog policy と supervisor tick を追加し、Run の TTL/idle/patch 閾値で cancel するよう実装。
   - 変更ファイル: `schemas/cork.policy.v0.1.schema.json`, `crates/cork-core/src/engine/watchdog.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-store/src/lib.rs`。
   - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] 既存修正の健全性確認として lint/test/pre-commit を再実行。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
 
 
 ---
