@@ -38,6 +38,7 @@ pub struct CorkCoreService {
     event_logs: DashMap<String, Arc<InMemoryEventLog>>,
     event_log_config: EventLogConfig,
     graph_store: Arc<InMemoryGraphStore>,
+    limits: CorkCoreServiceLimits,
     log_store: Arc<InMemoryLogStore>,
     patch_store: Arc<InMemoryPatchStore>,
     run_registry: Arc<dyn RunRegistry>,
@@ -47,8 +48,36 @@ pub struct CorkCoreService {
 #[derive(Debug, Clone, Default)]
 pub struct CorkCoreServiceConfig {
     pub event_log: EventLogConfig,
+    pub limits: CorkCoreServiceLimits,
     pub log_store: LogStoreConfig,
 }
+
+#[derive(Debug, Clone)]
+pub struct CorkCoreServiceLimits {
+    pub contract_max_bytes: usize,
+    pub contract_max_stages: usize,
+    pub policy_max_bytes: usize,
+    pub patch_max_bytes: usize,
+    pub patch_max_ops: usize,
+    pub patch_max_nodes: usize,
+    pub patch_max_edges: usize,
+}
+
+impl Default for CorkCoreServiceLimits {
+    fn default() -> Self {
+        Self {
+            contract_max_bytes: 512 * 1024,
+            contract_max_stages: 128,
+            policy_max_bytes: 256 * 1024,
+            patch_max_bytes: 512 * 1024,
+            patch_max_ops: 2048,
+            patch_max_nodes: 512,
+            patch_max_edges: 2048,
+        }
+    }
+}
+
+pub const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 impl CorkCoreService {
     /// Creates a new CorkCoreService instance.
@@ -61,6 +90,7 @@ impl CorkCoreService {
             event_logs: DashMap::new(),
             event_log_config: config.event_log,
             graph_store: Arc::new(InMemoryGraphStore::new()),
+            limits: config.limits,
             log_store: Arc::new(InMemoryLogStore::new_with_config(config.log_store)),
             patch_store: Arc::new(InMemoryPatchStore::new()),
             run_registry: Arc::new(InMemoryRunRegistry::new()),
@@ -73,6 +103,7 @@ impl CorkCoreService {
             event_logs: DashMap::new(),
             event_log_config: EventLogConfig::default(),
             graph_store: Arc::new(InMemoryGraphStore::new()),
+            limits: CorkCoreServiceLimits::default(),
             log_store: Arc::new(InMemoryLogStore::new()),
             patch_store: Arc::new(InMemoryPatchStore::new()),
             run_registry,
@@ -129,6 +160,9 @@ pub(crate) struct GraphPatchMetadata {
     stage_id: String,
     node_kinds: Vec<String>,
     has_node_added: bool,
+    ops_count: usize,
+    node_added_count: usize,
+    edge_added_count: usize,
 }
 
 #[derive(Debug)]
@@ -258,6 +292,23 @@ fn verify_canonical_sha256(doc: &CanonicalJsonDocument) -> Result<Sha256Verifica
     }
 }
 
+fn reject_limit(reason: &str, actual: usize) -> PatchRejectReason {
+    PatchRejectReason::LimitExceeded {
+        limit: reason.to_string(),
+        actual,
+    }
+}
+
+fn enforce_max_bytes(label: &str, bytes: &[u8], limit: usize) -> Result<(), Box<Status>> {
+    if bytes.len() > limit {
+        return Err(Box::new(Status::resource_exhausted(format!(
+            "{label} exceeds max bytes {limit} (actual {})",
+            bytes.len()
+        ))));
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_graph_patch_metadata(
     patch: &CanonicalJsonDocument,
 ) -> Result<GraphPatchMetadata, PatchRejectReason> {
@@ -288,12 +339,18 @@ pub(crate) fn parse_graph_patch_metadata(
 
     let mut node_kinds = Vec::new();
     let mut has_node_added = false;
+    let mut node_added_count = 0;
+    let mut edge_added_count = 0;
     for op in ops {
         let op_type = op.get("op_type").and_then(|value| value.as_str());
         if op_type != Some("NODE_ADDED") {
+            if op_type == Some("EDGE_ADDED") {
+                edge_added_count += 1;
+            }
             continue;
         }
         has_node_added = true;
+        node_added_count += 1;
         let node = op
             .get("node_added")
             .and_then(|value| value.get("node"))
@@ -336,6 +393,9 @@ pub(crate) fn parse_graph_patch_metadata(
         stage_id,
         node_kinds,
         has_node_added,
+        ops_count: ops.len(),
+        node_added_count,
+        edge_added_count,
     })
 }
 
@@ -486,11 +546,35 @@ impl CorkCore for CorkCoreService {
         let contract = request
             .contract_manifest
             .ok_or_else(|| Status::invalid_argument("missing contract_manifest"))?;
+        enforce_max_bytes(
+            "contract_manifest",
+            &contract.canonical_json_utf8,
+            self.limits.contract_max_bytes,
+        )
+        .map_err(|status| *status)?;
         let policy = request
             .policy
             .ok_or_else(|| Status::invalid_argument("missing policy"))?;
+        enforce_max_bytes(
+            "policy",
+            &policy.canonical_json_utf8,
+            self.limits.policy_max_bytes,
+        )
+        .map_err(|status| *status)?;
         let contract_json: Value = serde_json::from_slice(&contract.canonical_json_utf8)
             .map_err(|err| Status::invalid_argument(format!("invalid contract json: {err}")))?;
+        let stage_count = contract_json
+            .get("contract_graph")
+            .and_then(|graph| graph.get("stages"))
+            .and_then(|stages| stages.as_array())
+            .map(|stages| stages.len())
+            .ok_or_else(|| Status::invalid_argument("contract_graph.stages is missing"))?;
+        if stage_count > self.limits.contract_max_stages {
+            return Err(Status::resource_exhausted(format!(
+                "contract_manifest exceeds max stages {} (actual {stage_count})",
+                self.limits.contract_max_stages
+            )));
+        }
         let policy_json: Value = serde_json::from_slice(&policy.canonical_json_utf8)
             .map_err(|err| Status::invalid_argument(format!("invalid policy json: {err}")))?;
         let validated_contract = validate_contract_manifest(&contract_json)
@@ -665,6 +749,12 @@ impl CorkCore for CorkCoreService {
         let patch = request
             .patch
             .ok_or_else(|| Status::invalid_argument("missing patch"))?;
+        if patch.canonical_json_utf8.len() > self.limits.patch_max_bytes {
+            return Ok(Response::new(reject_response(reject_limit(
+                "patch.bytes",
+                patch.canonical_json_utf8.len(),
+            ))));
+        }
         let verification = verify_canonical_sha256(&patch).map_err(|status| *status)?;
         if let Sha256Verification::Mismatch { expected, provided } = verification {
             let rejection_reason = PatchRejectReason::Sha256Mismatch {
@@ -677,6 +767,24 @@ impl CorkCore for CorkCoreService {
             Ok(metadata) => metadata,
             Err(reason) => return Ok(Response::new(reject_response(reason))),
         };
+        if metadata.ops_count > self.limits.patch_max_ops {
+            return Ok(Response::new(reject_response(reject_limit(
+                "patch.ops",
+                metadata.ops_count,
+            ))));
+        }
+        if metadata.node_added_count > self.limits.patch_max_nodes {
+            return Ok(Response::new(reject_response(reject_limit(
+                "patch.nodes",
+                metadata.node_added_count,
+            ))));
+        }
+        if metadata.edge_added_count > self.limits.patch_max_edges {
+            return Ok(Response::new(reject_response(reject_limit(
+                "patch.edges",
+                metadata.edge_added_count,
+            ))));
+        }
         if run_ctx.active_stage_id().await.as_deref() != Some(&metadata.stage_id) {
             return Ok(Response::new(reject_response(
                 PatchRejectReason::StageNotActive {
@@ -866,7 +974,7 @@ mod tests {
     use super::*;
     use cork_proto::cork::v1::{
         ApplyGraphPatchRequest, CanonicalJsonDocument, GetCompositeGraphRequest, GetLogsRequest,
-        LogRecord, RunHandle, Sha256, StreamRunEventsRequest,
+        LogRecord, RunHandle, Sha256, StreamRunEventsRequest, SubmitRunRequest,
     };
     use cork_store::{
         CreateRunInput, EventLogConfig, ExpansionPolicy, GraphStore, InMemoryRunRegistry, LogStore,
@@ -905,6 +1013,24 @@ mod tests {
     }
 
     fn build_contract_document() -> CanonicalJsonDocument {
+        build_contract_document_with_stages(1)
+    }
+
+    fn build_contract_document_with_stages(stage_count: usize) -> CanonicalJsonDocument {
+        let stages: Vec<Value> = (0..stage_count)
+            .map(|idx| {
+                json!({
+                    "stage_id": format!("stage-{idx}"),
+                    "expansion_policy": {
+                        "allow_dynamic": true,
+                        "allow_kinds": ["LLM"],
+                        "max_dynamic_nodes": 1,
+                        "max_steps_in_stage": 1,
+                        "allow_cross_stage_deps": "NONE"
+                    }
+                })
+            })
+            .collect();
         let payload = json!({
             "schema_version": "cork.contract_manifest.v0.1",
             "manifest_id": "manifest-1",
@@ -924,18 +1050,7 @@ mod tests {
                 }
             },
             "contract_graph": {
-                "stages": [
-                    {
-                        "stage_id": "stage-a",
-                        "expansion_policy": {
-                            "allow_dynamic": true,
-                            "allow_kinds": ["LLM"],
-                            "max_dynamic_nodes": 1,
-                            "max_steps_in_stage": 1,
-                            "allow_cross_stage_deps": "NONE"
-                        }
-                    }
-                ]
+                "stages": stages
             }
         });
         let canonical_json_utf8 = serde_json::to_vec(&payload).expect("serialize contract payload");
@@ -944,6 +1059,125 @@ mod tests {
             canonical_json_utf8,
             sha256: Some(build_sha256(&digest)),
             schema_id: "cork.contract_manifest.v0.1".to_string(),
+        }
+    }
+
+    fn build_policy_document() -> CanonicalJsonDocument {
+        let payload = json!({
+            "schema_version": "cork.policy.v0.1",
+            "policy_id": "policy-1234",
+            "run_budget": {
+                "wall_ms": 1000,
+                "deadline_mode": "RELATIVE",
+                "deadline_ms": 1000,
+                "tokens_in_max": 100,
+                "tokens_out_max": 0,
+                "cost_usd_max": 0.0,
+                "max_steps": 1,
+                "max_dynamic_nodes": 0,
+                "history_max_events": 100,
+                "history_max_bytes": 1024
+            },
+            "concurrency": {
+                "io_max": 1,
+                "cpu_max": 1,
+                "per_stage_max": 1,
+                "per_provider_max": 1
+            },
+            "retry": {
+                "max_attempts": 0,
+                "backoff": {
+                    "policy": "CONSTANT",
+                    "base_delay_ms": 0,
+                    "max_delay_ms": 0,
+                    "jitter": "NONE"
+                },
+                "retry_on": [],
+                "respect_retry_after": false,
+                "circuit_breaker": {
+                    "enabled": false,
+                    "open_after_failures": 1,
+                    "half_open_after_ms": 100
+                }
+            },
+            "rate_limit": {
+                "providers": []
+            },
+            "idle": {
+                "heartbeat_interval_ms": 100,
+                "idle_timeout_ms": 1000
+            },
+            "guardrails": {
+                "store_prompts": "none",
+                "store_completions": "none",
+                "store_tool_io": "none",
+                "pre_call": [],
+                "during_call": [],
+                "post_call": [],
+                "on_violation": {
+                    "action": "BLOCK",
+                    "max_retries": 0
+                }
+            },
+            "context": {
+                "token_counter": {
+                    "impl": "default",
+                    "strict_mode": false
+                },
+                "compression": {
+                    "enabled": false,
+                    "steps": []
+                }
+            },
+            "cache": {
+                "enabled": false,
+                "default_ttl_ms": 0,
+                "rules": []
+            },
+            "loop_detection": {
+                "max_steps": 1,
+                "max_dynamic_nodes": 0,
+                "no_progress": {
+                    "enabled": false,
+                    "repeat_threshold": 2,
+                    "fingerprint_keys": []
+                }
+            },
+            "retention": {
+                "event_log_ttl_ms": 0,
+                "artifact_ttl_ms": 0,
+                "trace_ttl_ms": 0
+            },
+            "scheduler": {
+                "mode": "LIST_HEURISTIC",
+                "tie_break": "FIFO"
+            },
+            "stage_auto_commit": {
+                "enabled": true,
+                "quiescence_ms": 10,
+                "max_open_ms": 20,
+                "exclude_when_waiting": false
+            },
+            "resource_pools": [
+                {
+                    "resource_id": "pool-2",
+                    "capacity": 2,
+                    "kind": "EXCLUSIVE",
+                    "tags": ["gpu"]
+                },
+                {
+                    "resource_id": "pool-1",
+                    "capacity": 1,
+                    "kind": "CUMULATIVE"
+                }
+            ]
+        });
+        let canonical_json_utf8 = serde_json::to_vec(&payload).expect("serialize policy payload");
+        let digest = sha256(&canonical_json_utf8);
+        CanonicalJsonDocument {
+            canonical_json_utf8,
+            sha256: Some(build_sha256(&digest)),
+            schema_id: "cork.policy.v0.1".to_string(),
         }
     }
 
@@ -1114,6 +1348,51 @@ mod tests {
         )
     }
 
+    async fn setup_service_with_run_and_limits(
+        limits: CorkCoreServiceLimits,
+        active_stage_id: &str,
+        allow_dynamic: bool,
+        allow_kinds: Vec<&str>,
+        next_patch_seq: u64,
+    ) -> (CorkCoreService, RunHandle) {
+        let service = CorkCoreService::with_config(CorkCoreServiceConfig {
+            event_log: EventLogConfig::default(),
+            limits,
+            log_store: LogStoreConfig::default(),
+        });
+        let run = service
+            .create_run(CreateRunInput {
+                active_stage_id: Some(active_stage_id.to_string()),
+                active_stage_expansion_policy: Some(ExpansionPolicy {
+                    allow_dynamic,
+                    allow_kinds: allow_kinds.into_iter().map(str::to_string).collect(),
+                }),
+                next_patch_seq: Some(next_patch_seq),
+                ..Default::default()
+            })
+            .await;
+        (
+            service,
+            RunHandle {
+                run_id: run.run_id().to_string(),
+            },
+        )
+    }
+
+    fn build_submit_request(
+        contract: CanonicalJsonDocument,
+        policy: CanonicalJsonDocument,
+    ) -> SubmitRunRequest {
+        SubmitRunRequest {
+            contract_manifest: Some(contract),
+            policy: Some(policy),
+            initial_input: None,
+            experiment_id: String::new(),
+            variant_id: String::new(),
+            trace_context: None,
+        }
+    }
+
     #[tokio::test]
     async fn stream_run_events_yields_backlog_and_live_updates() {
         let service = CorkCoreService::new();
@@ -1158,6 +1437,7 @@ mod tests {
                 max_age: None,
                 broadcast_capacity: 8,
             },
+            limits: CorkCoreServiceLimits::default(),
             log_store: LogStoreConfig::default(),
         });
         let run_id = "run-out-of-range";
@@ -1177,6 +1457,181 @@ mod tests {
             .await
             .expect_err("out of range");
         assert_eq!(err.code(), tonic::Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn submit_run_enforces_contract_size_limits() {
+        let contract = build_contract_document();
+        let policy = build_policy_document();
+        let contract_size = contract.canonical_json_utf8.len();
+
+        for (limit, should_accept) in [
+            (contract_size.saturating_sub(1), false),
+            (contract_size, true),
+            (contract_size + 1, true),
+        ] {
+            let limits = CorkCoreServiceLimits {
+                contract_max_bytes: limit,
+                policy_max_bytes: policy.canonical_json_utf8.len() + 1,
+                ..Default::default()
+            };
+            let service = CorkCoreService::with_config(CorkCoreServiceConfig {
+                event_log: EventLogConfig::default(),
+                limits,
+                log_store: LogStoreConfig::default(),
+            });
+            let request = build_submit_request(contract.clone(), policy.clone());
+            let result = service.submit_run(Request::new(request)).await;
+            if should_accept {
+                assert!(result.is_ok(), "limit {limit} should accept");
+            } else {
+                let err = result.expect_err("contract limit rejection");
+                assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_run_rejects_when_stage_count_exceeds_limit() {
+        let contract = build_contract_document_with_stages(2);
+        let policy = build_policy_document();
+        let limits = CorkCoreServiceLimits {
+            contract_max_stages: 1,
+            contract_max_bytes: contract.canonical_json_utf8.len() + 1,
+            policy_max_bytes: policy.canonical_json_utf8.len() + 1,
+            ..Default::default()
+        };
+        let service = CorkCoreService::with_config(CorkCoreServiceConfig {
+            event_log: EventLogConfig::default(),
+            limits,
+            log_store: LogStoreConfig::default(),
+        });
+        let request = build_submit_request(contract, policy);
+        let err = service
+            .submit_run(Request::new(request))
+            .await
+            .expect_err("stage count rejection");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_enforces_ops_limit_boundaries() {
+        let limits = CorkCoreServiceLimits {
+            patch_max_ops: 2,
+            patch_max_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+
+        for (count, should_accept) in [(1, true), (2, true), (3, false)] {
+            let (service, handle) =
+                setup_service_with_run_and_limits(limits.clone(), "stage-a", true, vec!["LLM"], 0)
+                    .await;
+            let ops = Value::Array(
+                (0..count)
+                    .map(|idx| state_put_op("RUN", None, "/value", json!(idx)))
+                    .collect(),
+            );
+            let patch = build_patch_document(&handle.run_id, 0, "stage-a", ops);
+            let request = ApplyGraphPatchRequest {
+                handle: Some(handle.clone()),
+                patch: Some(patch),
+                actor_id: String::new(),
+            };
+            let response = service
+                .apply_graph_patch(Request::new(request))
+                .await
+                .expect("apply patch")
+                .into_inner();
+            assert_eq!(response.accepted, should_accept, "ops count {count}");
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_enforces_node_and_edge_limits() {
+        let node_limits = CorkCoreServiceLimits {
+            patch_max_nodes: 1,
+            patch_max_edges: 10,
+            patch_max_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+
+        let (service, handle) =
+            setup_service_with_run_and_limits(node_limits, "stage-a", true, vec!["LLM"], 0).await;
+        let ops = json!([
+            node_added_op_with_id("node-1", "LLM"),
+            node_added_op_with_id("node-2", "LLM")
+        ]);
+        let patch = build_patch_document(&handle.run_id, 0, "stage-a", ops);
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle.clone()),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply patch")
+            .into_inner();
+        assert!(!response.accepted, "node limit should reject");
+
+        let edge_limits = CorkCoreServiceLimits {
+            patch_max_nodes: 10,
+            patch_max_edges: 1,
+            patch_max_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+
+        let (service, handle) =
+            setup_service_with_run_and_limits(edge_limits, "stage-a", true, vec!["LLM"], 0).await;
+        let ops = json!([
+            node_added_op_with_id("node-a", "LLM"),
+            node_added_op_with_id("node-b", "LLM"),
+            edge_added_op("node-a", "node-b"),
+            edge_added_op("node-a", "node-b")
+        ]);
+        let patch = build_patch_document(&handle.run_id, 0, "stage-a", ops);
+        let request = ApplyGraphPatchRequest {
+            handle: Some(handle.clone()),
+            patch: Some(patch),
+            actor_id: String::new(),
+        };
+        let response = service
+            .apply_graph_patch(Request::new(request))
+            .await
+            .expect("apply patch")
+            .into_inner();
+        assert!(!response.accepted, "edge limit should reject");
+    }
+
+    #[tokio::test]
+    async fn apply_graph_patch_enforces_patch_size_boundaries() {
+        let ops = json!([state_put_op("RUN", None, "/value", json!(1))]);
+        let patch = build_patch_document("run-size", 0, "stage-a", ops);
+        let patch_size = patch.canonical_json_utf8.len();
+
+        for (limit, should_accept) in [
+            (patch_size.saturating_sub(1), false),
+            (patch_size, true),
+            (patch_size + 1, true),
+        ] {
+            let limits = CorkCoreServiceLimits {
+                patch_max_bytes: limit,
+                ..Default::default()
+            };
+            let (service, handle) =
+                setup_service_with_run_and_limits(limits, "stage-a", true, vec!["LLM"], 0).await;
+            let request = ApplyGraphPatchRequest {
+                handle: Some(handle),
+                patch: Some(patch.clone()),
+                actor_id: String::new(),
+            };
+            let response = service
+                .apply_graph_patch(Request::new(request))
+                .await
+                .expect("apply patch")
+                .into_inner();
+            assert_eq!(response.accepted, should_accept, "limit {limit}");
+        }
     }
 
     #[tokio::test]

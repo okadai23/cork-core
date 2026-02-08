@@ -5,4 +5,6 @@
 
 pub mod core_service;
 
-pub use core_service::CorkCoreService;
+pub use core_service::{
+    CorkCoreService, CorkCoreServiceConfig, CorkCoreServiceLimits, DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+};

@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use cork_core::api::CorkCoreService;
+use cork_core::api::{CorkCoreService, DEFAULT_GRPC_MAX_MESSAGE_BYTES};
 use cork_core::engine::autocommit::tick_stage_auto_commit;
 use cork_core::engine::run::{
     NodeRuntimeState, NodeRuntimeStatus, StageRuntimeState, StageRuntimeStatus,
@@ -109,7 +109,11 @@ async fn start_worker_server() -> (tonic::transport::Channel, tokio::task::JoinH
     let incoming = TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(CorkWorkerServer::new(TestWorker))
+            .add_service(
+                CorkWorkerServer::new(TestWorker)
+                    .max_decoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES),
+            )
             .serve_with_incoming(incoming)
             .await
             .expect("serve worker");

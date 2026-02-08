@@ -39,6 +39,10 @@ pub enum PatchRejectReason {
         from: String,
         to: String,
     },
+    LimitExceeded {
+        limit: String,
+        actual: usize,
+    },
     InvalidPatch {
         message: String,
     },
@@ -83,6 +87,9 @@ impl fmt::Display for PatchRejectReason {
             PatchRejectReason::UnknownNodeId { node_id } => write!(f, "unknown node_id: {node_id}"),
             PatchRejectReason::CycleDetected { from, to } => {
                 write!(f, "cycle detected: {from} -> {to}")
+            }
+            PatchRejectReason::LimitExceeded { limit, actual } => {
+                write!(f, "limit exceeded: {limit} (actual {actual})")
             }
             PatchRejectReason::InvalidPatch { message } => write!(f, "invalid patch: {message}"),
         }
