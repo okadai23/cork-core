@@ -1359,7 +1359,7 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 ---
 
-## [ ] CORE-103: ApplyGraphPatch の完全原子性（partial applyを絶対に起こさない）
+## [x] CORE-103: ApplyGraphPatch の完全原子性（partial applyを絶対に起こさない）
 **Priority:** P0
 **Type:** Correctness / Data integrity
 **Depends on:** CORE-101（推奨：ロック整理後の方が安全）
@@ -1372,16 +1372,16 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - 失敗パスで state/graph が変化しないことをテストで保証
 
 **Subtasks**
-- [ ] Patch適用を `validate_patch(...) -> ValidatedPatch` と `commit_patch(validated)` に分割
-- [ ] `commit_patch` は「全部適用できる」前提でのみ mutate
-- [ ] in-memory での実装案:
+- [x] Patch適用を `validate_patch(...) -> ValidatedPatch` と `commit_patch(validated)` に分割
+- [x] `commit_patch` は「全部適用できる」前提でのみ mutate
+- [x] in-memory での実装案:
   - [ ] Copy-on-write（cloneして適用→成功したらswap）
-  - [ ] もしくは transaction log を積んで最後に反映
-- [ ] 失敗ケースのテスト追加:
-  - [ ] ops途中で不正 node_id / edge / pointer が出る
-  - [ ] allow_kinds違反
-  - [ ] side_effect の key 欠落
-  - => いずれも graph/state が不変であることを検証
+  - [x] もしくは transaction log を積んで最後に反映
+- [x] 失敗ケースのテスト追加:
+  - [x] ops途中で不正 node_id / edge / pointer が出る
+  - [x] allow_kinds違反
+  - [x] side_effect の key 欠落
+  - [x] => いずれも graph/state が不変であることを検証
 
 **DoD**
 - 「rejectされたpatchで状態が変わらない」を統合テストで保証
@@ -1395,6 +1395,14 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 **Docs**
 - docs/specification.md に「Patch原子性（all-or-nothing）」を明記
+
+### 進捗
+- [DONE] GraphPatch適用をvalidate/commitに分割し、検証でのみ失敗させてからcommitする構成に変更。
+  - 変更ファイル: `crates/cork-core/src/engine/patch.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-store/src/lib.rs`。
+- [DONE] 失敗時にgraph/state/patchesが変化しないことをユニット・統合テストで検証。
+  - 変更ファイル: `crates/cork-core/src/engine/patch.rs`, `crates/cork-core/src/api/core_service.rs`。
+- [DONE] 仕様書にGraphPatchのall-or-nothingを追記。
+  - 変更ファイル: `docs/specification.md`。
 
 
 ---

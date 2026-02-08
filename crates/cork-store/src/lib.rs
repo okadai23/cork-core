@@ -547,14 +547,14 @@ impl StateStore for InMemoryStateStore {
     ) -> Result<(), StateStoreError> {
         let mut state = self.states.entry(run_id.to_string()).or_default();
         match scope {
-            "RUN" => apply_pointer_mut(&mut state.run_state, json_pointer, value),
+            "RUN" => apply_state_put_value(&mut state.run_state, json_pointer, value),
             "STAGE" => {
                 let stage_id = stage_id.ok_or(StateStoreError::MissingStageId)?;
                 let entry = state
                     .stage_state
                     .entry(stage_id.to_string())
                     .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                apply_pointer_mut(entry, json_pointer, value)
+                apply_state_put_value(entry, json_pointer, value)
             }
             _ => Err(StateStoreError::InvalidJsonPointer(format!(
                 "unknown scope {scope}"
@@ -601,6 +601,14 @@ fn apply_pointer_mut(
     };
     *target = value;
     Ok(())
+}
+
+pub fn apply_state_put_value(
+    root: &mut Value,
+    json_pointer: &str,
+    value: Value,
+) -> Result<(), StateStoreError> {
+    apply_pointer_mut(root, json_pointer, value)
 }
 
 fn ensure_pointer_path(root: &mut Value, json_pointer: &str) -> Result<(), StateStoreError> {

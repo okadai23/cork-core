@@ -133,6 +133,9 @@ CORKは相互運用性を確保するため、以下の規格・概念を採用�
 - patch_seqは **0,1,2,...** の厳密連番
 - 欠番のPatchはCoreが拒否
 
+### 5.3 GraphPatchの原子性（all-or-nothing）
+- GraphPatchは **検証と適用を分離** し、rejectされた場合は Graph/State/PatchStore に **一切変更を加えない**。
+
 ---
 
 ## 6. 参照式（state参照）

@@ -1,8 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use cork_hash::{composite_graph_hash, patch_hash};
 use cork_proto::cork::v1::{CanonicalJsonDocument, HashBundle, Sha256};
-use cork_store::{GraphStore, GraphStoreError, NodeSpec, RunCtx, StateStore, StateStoreError};
+use cork_store::{
+    GraphStore, GraphStoreError, NodeSpec, RunCtx, StateStore, StateStoreError,
+    apply_state_put_value,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +142,33 @@ pub struct PatchTracker {
     patch_hashes: Vec<[u8; 32]>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidatedGraphPatch {
+    run_id: String,
+    ops: Vec<GraphPatchOp>,
+}
+
+#[derive(Debug, Clone)]
+enum GraphPatchOp {
+    NodeAdded(NodeSpec),
+    EdgeAdded {
+        from: String,
+        to: String,
+    },
+    StatePut {
+        scope: String,
+        stage_id: Option<String>,
+        json_pointer: String,
+        value: Value,
+    },
+    NodeUpdated {
+        node_id: String,
+        ttl_ms: Option<u64>,
+        scheduling: Option<Value>,
+        htn: Option<Value>,
+    },
+}
+
 impl PatchTracker {
     pub fn new(contract_hash: [u8; 32]) -> Self {
         Self {
@@ -181,18 +212,197 @@ fn bytes_to_sha256(bytes: &[u8; 32]) -> Sha256 {
     }
 }
 
-pub fn apply_graph_patch_ops(
+struct GraphOverlay<'a> {
+    graph_store: &'a dyn GraphStore,
+    existing_nodes: HashMap<String, NodeSpec>,
+    existing_deps: HashMap<String, Vec<String>>,
+    added_nodes: HashMap<String, NodeSpec>,
+    added_edges: HashMap<String, Vec<String>>,
+}
+
+impl<'a> GraphOverlay<'a> {
+    fn new(graph_store: &'a dyn GraphStore) -> Self {
+        Self {
+            graph_store,
+            existing_nodes: HashMap::new(),
+            existing_deps: HashMap::new(),
+            added_nodes: HashMap::new(),
+            added_edges: HashMap::new(),
+        }
+    }
+
+    fn node_exists(&mut self, run_id: &str, node_id: &str) -> bool {
+        if self.added_nodes.contains_key(node_id) {
+            return true;
+        }
+        if self.existing_nodes.contains_key(node_id) {
+            return true;
+        }
+        if let Some(node) = self.graph_store.node(run_id, node_id) {
+            self.existing_nodes.insert(node_id.to_string(), node);
+            return true;
+        }
+        false
+    }
+
+    fn ensure_node_exists(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<(), GraphPatchApplyError> {
+        if self.node_exists(run_id, node_id) {
+            Ok(())
+        } else {
+            Err(GraphPatchApplyError::GraphStore(
+                GraphStoreError::NodeNotFound(node_id.to_string()),
+            ))
+        }
+    }
+
+    fn get_deps(&mut self, run_id: &str, node_id: &str) -> Vec<String> {
+        let mut deps = if let Some(node) = self.added_nodes.get(node_id) {
+            node.deps.clone()
+        } else {
+            if let Some(existing) = self.existing_deps.get(node_id) {
+                existing.clone()
+            } else {
+                let fetched = self.graph_store.deps(run_id, node_id).unwrap_or_default();
+                self.existing_deps
+                    .insert(node_id.to_string(), fetched.clone());
+                fetched
+            }
+        };
+        if let Some(extra) = self.added_edges.get(node_id) {
+            for dep in extra {
+                if !deps.iter().any(|existing| existing == dep) {
+                    deps.push(dep.clone());
+                }
+            }
+        }
+        deps
+    }
+
+    fn would_create_cycle(&mut self, run_id: &str, from: &str, to: &str) -> bool {
+        if from == to {
+            return true;
+        }
+        let mut stack = vec![from.to_string()];
+        let mut visited: HashSet<String> = HashSet::new();
+        while let Some(node) = stack.pop() {
+            if node == to {
+                return true;
+            }
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            for dep in self.get_deps(run_id, &node) {
+                stack.push(dep);
+            }
+        }
+        false
+    }
+
+    fn add_node(&mut self, node: NodeSpec) {
+        self.added_nodes.insert(node.node_id.clone(), node);
+    }
+
+    fn add_edge(&mut self, from: &str, to: &str) {
+        let deps = self.added_edges.entry(to.to_string()).or_default();
+        if !deps.iter().any(|dep| dep == from) {
+            deps.push(from.to_string());
+        }
+    }
+
+    fn update_node(
+        &mut self,
+        node_id: &str,
+        ttl_ms: Option<u64>,
+        scheduling: Option<Value>,
+        htn: Option<Value>,
+    ) {
+        if let Some(node) = self.added_nodes.get_mut(node_id) {
+            if let Some(ttl_ms) = ttl_ms {
+                node.ttl_ms = Some(ttl_ms);
+            }
+            if scheduling.is_some() {
+                node.scheduling = scheduling;
+            }
+            if htn.is_some() {
+                node.htn = htn;
+            }
+        }
+    }
+}
+
+struct StateOverlay<'a> {
+    state_store: &'a dyn StateStore,
+    run_id: String,
+    run_state: Value,
+    stage_state: HashMap<String, Value>,
+}
+
+impl<'a> StateOverlay<'a> {
+    fn new(run_id: &str, state_store: &'a dyn StateStore) -> Self {
+        Self {
+            state_store,
+            run_id: run_id.to_string(),
+            run_state: state_store
+                .run_state(run_id)
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            stage_state: HashMap::new(),
+        }
+    }
+
+    fn stage_entry(&mut self, stage_id: &str) -> &mut Value {
+        self.stage_state
+            .entry(stage_id.to_string())
+            .or_insert_with(|| {
+                self.state_store
+                    .stage_state(&self.run_id, stage_id)
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+            })
+    }
+
+    fn apply_state_put(
+        &mut self,
+        scope: &str,
+        stage_id: Option<&str>,
+        json_pointer: &str,
+        value: Value,
+    ) -> Result<(), GraphPatchApplyError> {
+        match scope {
+            "RUN" => apply_state_put_value(&mut self.run_state, json_pointer, value)
+                .map_err(GraphPatchApplyError::StateStore),
+            "STAGE" => {
+                let stage_id = stage_id.ok_or(GraphPatchApplyError::StateStore(
+                    StateStoreError::MissingStageId,
+                ))?;
+                let entry = self.stage_entry(stage_id);
+                apply_state_put_value(entry, json_pointer, value)
+                    .map_err(GraphPatchApplyError::StateStore)
+            }
+            _ => Err(GraphPatchApplyError::StateStore(
+                StateStoreError::InvalidJsonPointer(format!("unknown scope {scope}")),
+            )),
+        }
+    }
+}
+
+pub fn validate_graph_patch(
     run_id: &str,
     patch: &CanonicalJsonDocument,
     graph_store: &dyn GraphStore,
     state_store: &dyn StateStore,
-) -> Result<(), GraphPatchApplyError> {
+) -> Result<ValidatedGraphPatch, GraphPatchApplyError> {
     let value: Value = serde_json::from_slice(&patch.canonical_json_utf8)
         .map_err(|err| GraphPatchApplyError::InvalidPatch(format!("invalid patch json: {err}")))?;
     let ops = value
         .get("ops")
         .and_then(|value| value.as_array())
         .ok_or_else(|| GraphPatchApplyError::InvalidPatch("ops is missing".to_string()))?;
+    let mut graph_overlay = GraphOverlay::new(graph_store);
+    let mut state_overlay = StateOverlay::new(run_id, state_store);
+    let mut validated_ops = Vec::with_capacity(ops.len());
     for op in ops {
         let op_type = op
             .get("op_type")
@@ -207,9 +417,13 @@ pub fn apply_graph_patch_ops(
                         GraphPatchApplyError::InvalidPatch("node_added.node is missing".to_string())
                     })?;
                 let node_spec = parse_node_spec(node)?;
-                graph_store
-                    .add_node(run_id, node_spec)
-                    .map_err(GraphPatchApplyError::GraphStore)?;
+                if graph_overlay.node_exists(run_id, &node_spec.node_id) {
+                    return Err(GraphPatchApplyError::GraphStore(
+                        GraphStoreError::NodeAlreadyExists(node_spec.node_id),
+                    ));
+                }
+                graph_overlay.add_node(node_spec.clone());
+                validated_ops.push(GraphPatchOp::NodeAdded(node_spec));
             }
             "EDGE_ADDED" => {
                 let edge = op.get("edge_added").ok_or_else(|| {
@@ -227,9 +441,21 @@ pub fn apply_graph_patch_ops(
                     .ok_or_else(|| {
                         GraphPatchApplyError::InvalidPatch("edge_added.to is missing".to_string())
                     })?;
-                graph_store
-                    .add_edge(run_id, from, to)
-                    .map_err(GraphPatchApplyError::GraphStore)?;
+                graph_overlay.ensure_node_exists(run_id, from)?;
+                graph_overlay.ensure_node_exists(run_id, to)?;
+                if graph_overlay.would_create_cycle(run_id, from, to) {
+                    return Err(GraphPatchApplyError::GraphStore(
+                        GraphStoreError::CycleDetected {
+                            from: from.to_string(),
+                            to: to.to_string(),
+                        },
+                    ));
+                }
+                graph_overlay.add_edge(from, to);
+                validated_ops.push(GraphPatchOp::EdgeAdded {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                });
             }
             "STATE_PUT" => {
                 let state_put = op.get("state_put").ok_or_else(|| {
@@ -253,9 +479,13 @@ pub fn apply_graph_patch_ops(
                 let value = state_put.get("value").cloned().ok_or_else(|| {
                     GraphPatchApplyError::InvalidPatch("state_put.value is missing".to_string())
                 })?;
-                state_store
-                    .apply_state_put(run_id, scope, stage_id, json_pointer, value)
-                    .map_err(GraphPatchApplyError::StateStore)?;
+                state_overlay.apply_state_put(scope, stage_id, json_pointer, value.clone())?;
+                validated_ops.push(GraphPatchOp::StatePut {
+                    scope: scope.to_string(),
+                    stage_id: stage_id.map(str::to_string),
+                    json_pointer: json_pointer.to_string(),
+                    value,
+                });
             }
             "NODE_UPDATED" => {
                 let node_updated = op.get("node_updated").ok_or_else(|| {
@@ -275,15 +505,63 @@ pub fn apply_graph_patch_ops(
                 let ttl_ms = patch.get("ttl_ms").and_then(|value| value.as_u64());
                 let scheduling = patch.get("scheduling").cloned();
                 let htn = patch.get("htn").cloned();
-                graph_store
-                    .update_node(run_id, node_id, ttl_ms, scheduling, htn)
-                    .map_err(GraphPatchApplyError::GraphStore)?;
+                graph_overlay.ensure_node_exists(run_id, node_id)?;
+                graph_overlay.update_node(node_id, ttl_ms, scheduling.clone(), htn.clone());
+                validated_ops.push(GraphPatchOp::NodeUpdated {
+                    node_id: node_id.to_string(),
+                    ttl_ms,
+                    scheduling,
+                    htn,
+                });
             }
             other => {
                 return Err(GraphPatchApplyError::InvalidPatch(format!(
                     "unsupported op_type {other}"
                 )));
             }
+        }
+    }
+    Ok(ValidatedGraphPatch {
+        run_id: run_id.to_string(),
+        ops: validated_ops,
+    })
+}
+
+pub fn commit_graph_patch(
+    validated: ValidatedGraphPatch,
+    graph_store: &dyn GraphStore,
+    state_store: &dyn StateStore,
+) -> Result<(), GraphPatchApplyError> {
+    for op in validated.ops {
+        match op {
+            GraphPatchOp::NodeAdded(node_spec) => graph_store
+                .add_node(&validated.run_id, node_spec)
+                .map_err(GraphPatchApplyError::GraphStore)?,
+            GraphPatchOp::EdgeAdded { from, to } => graph_store
+                .add_edge(&validated.run_id, &from, &to)
+                .map_err(GraphPatchApplyError::GraphStore)?,
+            GraphPatchOp::StatePut {
+                scope,
+                stage_id,
+                json_pointer,
+                value,
+            } => state_store
+                .apply_state_put(
+                    &validated.run_id,
+                    &scope,
+                    stage_id.as_deref(),
+                    &json_pointer,
+                    value,
+                )
+                .map_err(GraphPatchApplyError::StateStore)?,
+            GraphPatchOp::NodeUpdated {
+                node_id,
+                ttl_ms,
+                scheduling,
+                htn,
+            } => graph_store
+                .update_node(&validated.run_id, &node_id, ttl_ms, scheduling, htn)
+                .map_err(GraphPatchApplyError::GraphStore)?,
         }
     }
     Ok(())
@@ -340,7 +618,9 @@ mod tests {
     use crate::api::core_service::parse_graph_patch_metadata;
     use cork_hash::contract_hash;
     use cork_proto::cork::v1::CanonicalJsonDocument;
-    use cork_store::{CreateRunInput, InMemoryRunRegistry, RunRegistry};
+    use cork_store::{
+        CreateRunInput, InMemoryGraphStore, InMemoryRunRegistry, InMemoryStateStore, RunRegistry,
+    };
     use serde_json::json;
 
     fn build_patch_document(
@@ -361,6 +641,50 @@ mod tests {
             sha256: None,
             schema_id: "cork.graph_patch.v0.1".to_string(),
         }
+    }
+
+    fn node_added_op_with_id(node_id: &str, kind: &str) -> Value {
+        json!({
+            "op_type": "NODE_ADDED",
+            "node_added": {
+                "node": {
+                    "node_id": node_id,
+                    "kind": kind,
+                    "anchor_position": "WITHIN",
+                    "deps": [],
+                    "exec": {
+                        "llm": {
+                            "provider": "test",
+                            "model": "test",
+                            "messages": [ { "role": "user", "parts": [ { "text": "hi" } ] } ]
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn state_put_op(
+        scope: &str,
+        stage_id: Option<&str>,
+        json_pointer: &str,
+        value: serde_json::Value,
+    ) -> Value {
+        let mut state_put = json!({
+            "scope": scope,
+            "json_pointer": json_pointer,
+            "value": value
+        });
+        if let Some(stage_id) = stage_id {
+            state_put
+                .as_object_mut()
+                .expect("state_put object")
+                .insert("stage_id".to_string(), json!(stage_id));
+        }
+        json!({
+            "op_type": "STATE_PUT",
+            "state_put": state_put
+        })
     }
 
     #[tokio::test]
@@ -482,5 +806,26 @@ mod tests {
             result,
             Err(PatchRejectReason::IdempotencyRequired)
         ));
+    }
+
+    #[test]
+    fn apply_patch_atomicity() {
+        let graph_store = InMemoryGraphStore::new();
+        let state_store = InMemoryStateStore::new();
+        let patch = build_patch_document(
+            "run-1",
+            0,
+            "stage-a",
+            json!([
+                node_added_op_with_id("node-a", "LLM"),
+                state_put_op("RUN", None, "invalid", json!(1))
+            ]),
+        );
+
+        let result = validate_graph_patch("run-1", &patch, &graph_store, &state_store);
+
+        assert!(result.is_err());
+        assert!(graph_store.node("run-1", "node-a").is_none());
+        assert!(state_store.run_state("run-1").is_none());
     }
 }
