@@ -1044,6 +1044,7 @@ pub enum EventLogError {
 pub trait EventLog: Send + Sync {
     async fn append(&self, event: RunEvent) -> RunEvent;
     async fn subscribe(&self, since_seq: u64) -> Result<EventSubscription, EventLogError>;
+    async fn flush(&self);
 }
 
 #[derive(Debug)]
@@ -1181,6 +1182,8 @@ impl EventLog for InMemoryEventLog {
         };
         Ok(EventSubscription { backlog, receiver })
     }
+
+    async fn flush(&self) {}
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1223,6 +1226,7 @@ pub trait LogStore: Send + Sync {
         filters: LogFilters,
         page_size: usize,
     ) -> LogPage;
+    fn flush(&self);
 }
 
 #[derive(Debug)]
@@ -1415,6 +1419,8 @@ impl LogStore for InMemoryLogStore {
             next_page_token,
         }
     }
+
+    fn flush(&self) {}
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use crate::engine::run::{
     node_stage_id, run_ctx_to_response, validate_contract_manifest, validate_policy,
 };
 use crate::engine::watchdog::enforce_watchdog;
+use crate::shutdown::{ShutdownMode, ShutdownPolicy, ShutdownState};
 use cork_hash::{composite_graph_hash, contract_hash, patch_hash, policy_hash, sha256};
 use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
@@ -29,6 +30,7 @@ use dashmap::DashMap;
 use prost_types::Timestamp;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
@@ -44,6 +46,8 @@ pub struct CorkCoreService {
     log_store: Arc<InMemoryLogStore>,
     patch_store: Arc<InMemoryPatchStore>,
     run_registry: Arc<dyn RunRegistry>,
+    shutdown_policy: ShutdownPolicy,
+    shutdown_state: Arc<ShutdownState>,
     state_store: Arc<InMemoryStateStore>,
 }
 
@@ -52,6 +56,7 @@ pub struct CorkCoreServiceConfig {
     pub event_log: EventLogConfig,
     pub limits: CorkCoreServiceLimits,
     pub log_store: LogStoreConfig,
+    pub shutdown_policy: ShutdownPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +101,8 @@ impl CorkCoreService {
             log_store: Arc::new(InMemoryLogStore::new_with_config(config.log_store)),
             patch_store: Arc::new(InMemoryPatchStore::new()),
             run_registry: Arc::new(InMemoryRunRegistry::new()),
+            shutdown_policy: config.shutdown_policy,
+            shutdown_state: ShutdownState::new(),
             state_store: Arc::new(InMemoryStateStore::new()),
         }
     }
@@ -109,6 +116,8 @@ impl CorkCoreService {
             log_store: Arc::new(InMemoryLogStore::new()),
             patch_store: Arc::new(InMemoryPatchStore::new()),
             run_registry,
+            shutdown_policy: ShutdownPolicy::default(),
+            shutdown_state: ShutdownState::new(),
             state_store: Arc::new(InMemoryStateStore::new()),
         }
     }
@@ -141,6 +150,14 @@ impl CorkCoreService {
         Arc::clone(&self.state_store)
     }
 
+    pub fn shutdown_state(&self) -> Arc<ShutdownState> {
+        Arc::clone(&self.shutdown_state)
+    }
+
+    pub fn shutdown_policy(&self) -> ShutdownPolicy {
+        self.shutdown_policy.clone()
+    }
+
     pub async fn tick_watchdog(&self) {
         self.tick_watchdog_at(SystemTime::now()).await;
     }
@@ -161,6 +178,95 @@ impl CorkCoreService {
                 break;
             }
         }
+    }
+
+    pub async fn handle_shutdown(&self) {
+        let policy = self.shutdown_policy.clone();
+        self.shutdown_state.begin();
+        match policy.mode {
+            ShutdownMode::Cancel => {
+                self.cancel_active_runs("shutdown_cancel").await;
+            }
+            ShutdownMode::Drain => {
+                let deadline = Instant::now() + policy.drain_timeout;
+                loop {
+                    if self.all_runs_terminal().await {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        self.cancel_active_runs("shutdown_drain_timeout").await;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        self.flush_stores().await;
+    }
+
+    async fn all_runs_terminal(&self) -> bool {
+        let mut page_token = None;
+        loop {
+            let page = self
+                .run_registry
+                .list_runs(page_token.as_deref(), RunFilters::default(), 200)
+                .await;
+            for run_ctx in page.runs {
+                let status = run_ctx.metadata().await.status;
+                if !is_terminal(status) {
+                    return false;
+                }
+            }
+            page_token = page.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+        true
+    }
+
+    async fn cancel_active_runs(&self, reason: &str) {
+        let now = SystemTime::now();
+        let mut page_token = None;
+        loop {
+            let page = self
+                .run_registry
+                .list_runs(page_token.as_deref(), RunFilters::default(), 200)
+                .await;
+            for run_ctx in page.runs {
+                let status = run_ctx.metadata().await.status;
+                if is_terminal(status) {
+                    continue;
+                }
+                run_ctx.set_status(RunStatus::RunCancelled).await;
+                run_ctx.set_last_progress_at(Some(now)).await;
+                let event_log = self.event_log_for_run(run_ctx.run_id());
+                let event = RunEvent {
+                    event_seq: 0,
+                    ts: Some(system_time_to_timestamp(now)),
+                    event: Some(run_event::Event::Policy(
+                        cork_proto::cork::v1::PolicyEvent {
+                            kind: "shutdown_cancel".to_string(),
+                            attrs: [("reason".to_string(), reason.to_string())]
+                                .into_iter()
+                                .collect(),
+                        },
+                    )),
+                };
+                event_log.append(event).await;
+            }
+            page_token = page.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+    }
+
+    async fn flush_stores(&self) {
+        for entry in self.event_logs.iter() {
+            entry.value().flush().await;
+        }
+        self.log_store.flush();
     }
 }
 
@@ -216,6 +322,24 @@ fn bytes_to_sha256(bytes: &[u8; 32]) -> Sha256 {
     Sha256 {
         bytes32: bytes.to_vec(),
     }
+}
+
+fn check_shutdown(state: &ShutdownState) -> Option<Status> {
+    if state.is_shutting_down() {
+        Some(Status::unavailable("server is shutting down"))
+    } else {
+        None
+    }
+}
+
+fn is_terminal(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::RunSucceeded
+            | RunStatus::RunFailed
+            | RunStatus::RunCancelled
+            | RunStatus::RunTimedOut
+    )
 }
 
 fn parse_expansion_policy(
@@ -552,6 +676,9 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<SubmitRunRequest>,
     ) -> Result<Response<SubmitRunResponse>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         let request = request.into_inner();
         if let Some(contract) = request.contract_manifest.as_ref()
             && let Sha256Verification::Mismatch { .. } =
@@ -664,6 +791,9 @@ impl CorkCore for CorkCoreService {
         &self,
         _request: Request<CancelRunRequest>,
     ) -> Result<Response<CancelRunResponse>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         Err(Status::unimplemented("CancelRun not yet implemented"))
     }
 
@@ -671,6 +801,9 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<GetRunRequest>,
     ) -> Result<Response<GetRunResponse>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         let request = request.into_inner();
         let handle = request
             .handle
@@ -693,6 +826,9 @@ impl CorkCore for CorkCoreService {
         &self,
         _request: Request<ListRunsRequest>,
     ) -> Result<Response<ListRunsResponse>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         Err(Status::unimplemented("ListRuns not yet implemented"))
     }
 
@@ -702,6 +838,9 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<StreamRunEventsRequest>,
     ) -> Result<Response<Self::StreamRunEventsStream>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         let request = request.into_inner();
         let handle = request
             .handle
@@ -761,6 +900,9 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<ApplyGraphPatchRequest>,
     ) -> Result<Response<ApplyGraphPatchResponse>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         let request = request.into_inner();
         let handle = request
             .handle
@@ -902,6 +1044,9 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<GetCompositeGraphRequest>,
     ) -> Result<Response<GetCompositeGraphResponse>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         let request = request.into_inner();
         let handle = request
             .handle
@@ -947,6 +1092,9 @@ impl CorkCore for CorkCoreService {
         &self,
         request: Request<GetLogsRequest>,
     ) -> Result<Response<GetLogsResponse>, Status> {
+        if let Some(status) = check_shutdown(&self.shutdown_state) {
+            return Err(status);
+        }
         let request = request.into_inner();
         let handle = request
             .handle
@@ -1387,6 +1535,7 @@ mod tests {
             event_log: EventLogConfig::default(),
             limits,
             log_store: LogStoreConfig::default(),
+            shutdown_policy: ShutdownPolicy::default(),
         });
         let run = service
             .create_run(CreateRunInput {
@@ -1467,6 +1616,7 @@ mod tests {
             },
             limits: CorkCoreServiceLimits::default(),
             log_store: LogStoreConfig::default(),
+            shutdown_policy: ShutdownPolicy::default(),
         });
         let run_id = "run-out-of-range";
         let log = service.event_log_for_run(run_id);
@@ -1507,6 +1657,7 @@ mod tests {
                 event_log: EventLogConfig::default(),
                 limits,
                 log_store: LogStoreConfig::default(),
+                shutdown_policy: ShutdownPolicy::default(),
             });
             let request = build_submit_request(contract.clone(), policy.clone());
             let result = service.submit_run(Request::new(request)).await;
@@ -1533,6 +1684,7 @@ mod tests {
             event_log: EventLogConfig::default(),
             limits,
             log_store: LogStoreConfig::default(),
+            shutdown_policy: ShutdownPolicy::default(),
         });
         let request = build_submit_request(contract, policy);
         let err = service

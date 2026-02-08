@@ -1604,7 +1604,7 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 ---
 
-## [ ] CORE-141: graceful shutdown（drain / flush / consistency）
+## [x] CORE-141: graceful shutdown（drain / flush / consistency）
 **Priority:** P1
 **Type:** Ops readiness
 **Depends on:** CORE-103, CORE-112
@@ -1619,16 +1619,24 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
   - event/log flush（永続化がある場合は必須）
 
 **Subtasks**
-- [ ] shutdown signal を受けて gRPC server を drain
-- [ ] Supervisor に cancel/drain コマンド送付
-- [ ] “停止時ポリシー” を設定で切替
-- [ ] テスト: 停止→再起動後に run が整合した状態で見える
+- [x] shutdown signal を受けて gRPC server を drain
+- [x] Supervisor に cancel/drain コマンド送付
+- [x] “停止時ポリシー” を設定で切替
+- [x] テスト: 停止→再起動後に run が整合した状態で見える
 
 **DoD**
 - “落とし方” が決まり、運用で事故らない
 
 **Acceptance Criteria**
-- shutdown でデータ不整合が起きない（少なくともE2Eで確認）
+- [x] shutdown でデータ不整合が起きない（少なくともE2Eで確認）
+
+### 進捗
+- [DONE] シャットダウンシグナルで gRPC を停止し、drain/cancel を切り替えるポリシーを追加。
+  - 変更ファイル: `crates/cork-core/src/main.rs`, `crates/cork-core/src/api/core_service.rs`, `crates/cork-core/src/shutdown.rs`。
+  - 検証: `make fmt`, `make lint`, `make test`, `pre-commit run --all-files`。
+- [DONE] シャットダウン時の Run キャンセルとイベント記録、E2E テストを追加。
+  - 変更ファイル: `crates/cork-core/tests/e2e_minimal.rs`, `crates/cork-store/src/lib.rs`。
+  - 検証: `make test`。
 
 
 ---

@@ -248,6 +248,13 @@ CoreとWorker間はgRPCで接続し、deadline/cancelを必ず伝播する。
 - Runごとに `contract_manifest` と `policy` を保存し、`run_id` から再取得できること。
 - `GetRun` は `hashes.policy_hash` に加えて、`policy.schema_id` と `policy.sha256` を返す。
 
+### 13.2 Graceful shutdown
+- shutdown シグナルを受け取ったら新規リクエストを停止する。
+- 進行中 Run の扱いはサーバ設定で切り替える（`drain`/`cancel`）。
+  - `drain`: 既存 Run が終端状態になるまで待機し、タイムアウト時に cancel する。
+  - `cancel`: 即時に Run を cancel し、理由を policy event に記録する。
+- event/log は永続化ストア実装に応じて flush する（in-memory は no-op）。
+
 ---
 
 ## 14. 参照実装資料
