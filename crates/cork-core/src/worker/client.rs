@@ -7,7 +7,7 @@ use cork_proto::cork::v1::{
     ArtifactRef as ProtoArtifactRef, InvokeToolRequest, InvokeToolResponse, InvokeToolStreamChunk,
     LogRecord, NodeStateChanged, NodeStatus, Payload, RunEvent, TraceContext,
 };
-use cork_store::{ArtifactRef, EventLog, LogStore, NodeOutput, NodePayload, StateStore};
+use cork_store::{ArtifactRef, EventLog, LogStore, NodeOutput, NodePayload, RunCtx, StateStore};
 use prost_types::Timestamp;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
@@ -49,6 +49,7 @@ pub struct InvocationContext<'a> {
     pub run_id: &'a str,
     pub stage_id: &'a str,
     pub node_id: &'a str,
+    pub run_ctx: Option<&'a RunCtx>,
     pub event_log: &'a dyn EventLog,
     pub log_store: &'a dyn LogStore,
     pub state_store: &'a dyn StateStore,
@@ -189,6 +190,7 @@ async fn handle_success(context: &InvocationContext<'_>, response: &InvokeToolRe
         .state_store
         .set_node_output(context.run_id, context.node_id, output);
     append_node_state(
+        context.run_ctx,
         context.event_log,
         context.stage_id,
         context.node_id,
@@ -201,6 +203,7 @@ async fn handle_success(context: &InvocationContext<'_>, response: &InvokeToolRe
 
 async fn handle_failure(context: &InvocationContext<'_>, status: &Status) {
     append_node_state(
+        context.run_ctx,
         context.event_log,
         context.stage_id,
         context.node_id,
@@ -267,6 +270,7 @@ async fn append_log(
 }
 
 async fn append_node_state(
+    run_ctx: Option<&RunCtx>,
     event_log: &dyn EventLog,
     stage_id: &str,
     node_id: &str,
@@ -286,6 +290,9 @@ async fn append_node_state(
         })),
     };
     event_log.append(event).await;
+    if let Some(run_ctx) = run_ctx {
+        run_ctx.touch_progress().await;
+    }
 }
 
 fn timeout_from_budget(now: SystemTime, budget: &InvocationBudget) -> Option<Duration> {
@@ -490,6 +497,7 @@ mod tests {
             run_id: "run-1",
             stage_id: "stage-a",
             node_id: "stage-a/node-a",
+            run_ctx: None,
             event_log: &event_log,
             log_store: &log_store,
             state_store: &state_store,
@@ -536,6 +544,7 @@ mod tests {
             run_id: "run-2",
             stage_id: "stage-b",
             node_id: "stage-b/node-b",
+            run_ctx: None,
             event_log: &event_log,
             log_store: &log_store,
             state_store: &state_store,

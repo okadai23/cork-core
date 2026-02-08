@@ -220,6 +220,7 @@ async fn apply_commit_transition(
         })),
     };
     event_log.append(event).await;
+    run_ctx.touch_progress().await;
     Some(AutoCommitResult {
         committed_stage_id: active_stage_id.to_string(),
         next_stage_id,

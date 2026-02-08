@@ -439,6 +439,7 @@ async fn e2e_submit_patch_execute_commit() {
         run_id: &run_id,
         stage_id: "stage1",
         node_id: "stage1/tool-1",
+        run_ctx: None,
         event_log: event_log.as_ref(),
         log_store: log_store.as_ref(),
         state_store: state_store.as_ref(),

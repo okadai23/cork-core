@@ -10,6 +10,7 @@ use crate::engine::patch::{PatchRejectReason, commit_graph_patch, validate_graph
 use crate::engine::run::{
     node_stage_id, run_ctx_to_response, validate_contract_manifest, validate_policy,
 };
+use crate::engine::watchdog::enforce_watchdog;
 use cork_hash::{composite_graph_hash, contract_hash, patch_hash, policy_hash, sha256};
 use cork_proto::cork::v1::run_event;
 use cork_proto::cork::v1::{
@@ -22,7 +23,7 @@ use cork_proto::cork::v1::{
 use cork_store::{
     CreateRunInput, EventLog, EventLogConfig, EventLogError, InMemoryEventLog, InMemoryGraphStore,
     InMemoryLogStore, InMemoryPatchStore, InMemoryRunRegistry, InMemoryStateStore, LogFilters,
-    LogStore, LogStoreConfig, PatchStore, RunCtx, RunRegistry,
+    LogStore, LogStoreConfig, PatchStore, RunCtx, RunFilters, RunRegistry,
 };
 use dashmap::DashMap;
 use prost_types::Timestamp;
@@ -34,8 +35,9 @@ use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tonic::{Request, Response, Status};
 
 /// The CorkCore service implementation.
+#[derive(Clone)]
 pub struct CorkCoreService {
-    event_logs: DashMap<String, Arc<InMemoryEventLog>>,
+    event_logs: Arc<DashMap<String, Arc<InMemoryEventLog>>>,
     event_log_config: EventLogConfig,
     graph_store: Arc<InMemoryGraphStore>,
     limits: CorkCoreServiceLimits,
@@ -87,7 +89,7 @@ impl CorkCoreService {
 
     pub fn with_config(config: CorkCoreServiceConfig) -> Self {
         Self {
-            event_logs: DashMap::new(),
+            event_logs: Arc::new(DashMap::new()),
             event_log_config: config.event_log,
             graph_store: Arc::new(InMemoryGraphStore::new()),
             limits: config.limits,
@@ -100,7 +102,7 @@ impl CorkCoreService {
 
     pub fn with_run_registry(run_registry: Arc<dyn RunRegistry>) -> Self {
         Self {
-            event_logs: DashMap::new(),
+            event_logs: Arc::new(DashMap::new()),
             event_log_config: EventLogConfig::default(),
             graph_store: Arc::new(InMemoryGraphStore::new()),
             limits: CorkCoreServiceLimits::default(),
@@ -137,6 +139,28 @@ impl CorkCoreService {
 
     pub fn state_store(&self) -> Arc<InMemoryStateStore> {
         Arc::clone(&self.state_store)
+    }
+
+    pub async fn tick_watchdog(&self) {
+        self.tick_watchdog_at(SystemTime::now()).await;
+    }
+
+    pub async fn tick_watchdog_at(&self, now: SystemTime) {
+        let mut page_token = None;
+        loop {
+            let page = self
+                .run_registry
+                .list_runs(page_token.as_deref(), RunFilters::default(), 200)
+                .await;
+            for run_ctx in page.runs {
+                let event_log = self.event_log_for_run(run_ctx.run_id());
+                enforce_watchdog(&run_ctx, event_log.as_ref(), now).await;
+            }
+            page_token = page.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
     }
 }
 
@@ -612,11 +636,13 @@ impl CorkCore for CorkCoreService {
                 status: Some(RunStatus::RunRunning),
                 hash_bundle: Some(hash_bundle.clone()),
                 stage_auto_commit: Some(validated_policy.stage_auto_commit),
+                watchdog_policy: validated_policy.watchdog,
                 next_patch_seq: Some(0),
                 active_stage_id: Some(active_stage_id.to_string()),
                 active_stage_expansion_policy: Some(expansion_policy),
                 stage_started_at: Some(now),
                 last_patch_at: Some(now),
+                last_progress_at: Some(now),
             })
             .await;
         self.patch_store
@@ -854,6 +880,7 @@ impl CorkCore for CorkCoreService {
                 },
             )));
         }
+        run_ctx.record_patch(&metadata.stage_id).await;
         run_ctx.advance_patch_seq().await;
         if stage_touch.touches_active_stage {
             run_ctx.touch_stage_patch().await;

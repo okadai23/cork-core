@@ -161,6 +161,17 @@
       }
     },
 
+    "watchdog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "run_ttl_ms": { "type": "integer", "minimum": 1, "maximum": 604800000 },
+        "idle_ttl_ms": { "type": "integer", "minimum": 1, "maximum": 604800000 },
+        "max_total_patch_count": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "max_patch_count_per_stage": { "type": "integer", "minimum": 1, "maximum": 1000000 }
+      }
+    },
+
     "guardrails": {
       "type": "object",
       "additionalProperties": false,
