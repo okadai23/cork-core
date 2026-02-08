@@ -1407,7 +1407,7 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 ---
 
-## [ ] CORE-102: SubmitRun で policy をストアへ保存し、取得可能にする（実験管理の土台）
+## [x] CORE-102: SubmitRun で policy をストアへ保存し、取得可能にする（実験管理の土台）
 **Priority:** P0
 **Type:** Correctness / Experiment reproducibility
 **Depends on:** CORE-103（推奨：整合性ルールが固まってから）
@@ -1420,12 +1420,12 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 - `GetRun` で policy hash / schema_id / sha256 を返す（返せない場合は GetPolicy API を追加）
 
 **Subtasks**
-- [ ] PatchStore（or RunStore）に policy 保存領域を追加
-- [ ] SubmitRun で policy を保存
-- [ ] GetRun で policyのhash bundle を返却（または `GetPolicy` RPCを追加）
-- [ ] テスト:
-  - [ ] SubmitRun -> GetRun で policy_hash が一致
-  - [ ] SubmitRun -> GetCompositeGraph の hash_bundle と整合
+- [x] PatchStore（or RunStore）に policy 保存領域を追加
+- [x] SubmitRun で policy を保存
+- [x] GetRun で policyのhash bundle を返却（または `GetPolicy` RPCを追加）
+- [x] テスト:
+  - [x] SubmitRun -> GetRun で policy_hash が一致
+  - [x] SubmitRun -> GetCompositeGraph の hash_bundle と整合
 
 **DoD**
 - runをキーに “policyを含む再現材料” が取れる
@@ -1435,6 +1435,14 @@ P0（バグ/性能劣化の芽）を先に全部潰す:
 
 **Docs**
 - docs/specification.md に policy保管の要件を追記
+
+### 進捗
+- [DONE] PatchStoreにpolicy保存領域を追加し、SubmitRun/GetRunでpolicy取得を可能にした。
+  - 変更ファイル: `crates/cork-store/src/lib.rs`, `crates/cork-core/src/api/core_service.rs`, `proto/cork/v1/core.proto`, `crates/cork-core/src/engine/run.rs`。
+- [DONE] GetRunでpolicyのschema_id/sha256とhash bundleの整合性を検証する統合テストを追加。
+  - 変更ファイル: `crates/cork-core/tests/e2e_minimal.rs`。
+- [DONE] 仕様書にpolicy保存とGetRun返却要件を追記。
+  - 変更ファイル: `docs/specification.md`。
 
 
 ---

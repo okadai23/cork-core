@@ -244,6 +244,10 @@ MERGEノードは入力ノードspanへのリンクを張り、採用/棄却を�
 ## 13. API（gRPC）とdeadline/cancel
 CoreとWorker間はgRPCで接続し、deadline/cancelを必ず伝播する。
 
+### 13.1 Runの再現材料
+- Runごとに `contract_manifest` と `policy` を保存し、`run_id` から再取得できること。
+- `GetRun` は `hashes.policy_hash` に加えて、`policy.schema_id` と `policy.sha256` を返す。
+
 ---
 
 ## 14. 参照実装資料
