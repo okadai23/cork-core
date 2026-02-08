@@ -16,8 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(
             CorkCoreServer::new(service)
-                .max_decoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES),
+                .max_decoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_BYTES),
         )
         .serve(addr)
         .await?;
